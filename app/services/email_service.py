@@ -10,6 +10,14 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+def warn_if_console_backend_in_production() -> None:
+    settings = get_settings()
+    if settings.app_env == "production" and settings.email_backend.lower() == "console":
+        logger.warning(
+            "EMAIL_BACKEND=console in production; verification emails are not being sent."
+        )
+
+
 class EmailService:
     def __init__(self) -> None:
         self.settings = get_settings()

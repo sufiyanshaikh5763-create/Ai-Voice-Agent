@@ -35,7 +35,27 @@ export function Chips<T extends string>({ options, value, onChange }: { options:
 export const Toggle = ({ on, onClick, label, disabled }: { on: boolean; onClick: () => void; label: string; disabled?: boolean }) => (
   <button className={`tog ${on ? 'on' : ''}`} role="switch" aria-checked={on} aria-label={label} disabled={disabled} onClick={onClick}><i /></button>
 );
-export const Meter = ({ used, limit }: { used: number; limit: number }) => <div className="meter"><i style={{ width: `${Math.min(100, Math.round((used / limit) * 100))}%` }} /></div>;
+export const Meter = ({ used, limit, percent, color }: { used: number; limit: number; percent?: number; color?: string }) => (
+  <div className="meter"><i style={{ width: `${Math.min(100, Math.max(0, Math.round(percent ?? (used / limit) * 100)))}%`, background: color }} /></div>
+);
+export function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }) {
+  const { toast } = useDash();
+  return (
+    <button
+      type="button"
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(value);
+          toast('Copied to clipboard');
+        } catch {
+          toast('Unable to copy to clipboard');
+        }
+      }}
+    >
+      {label}
+    </button>
+  );
+}
 export function Dialog({ title, children, actions }: { title: string; children?: ReactNode; actions?: ReactNode }) {
   return <><h3>{title}</h3>{children}<div className="acts">{actions}</div></>;
 }

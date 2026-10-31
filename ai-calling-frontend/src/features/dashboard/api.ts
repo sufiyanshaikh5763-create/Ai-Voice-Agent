@@ -9,8 +9,19 @@ import type {
   LogEntry,
   MockData,
   Plan,
+  AdminAppointment,
+  AdminClientIntegration,
+  AdminClientToolToken,
+  AdminHealthDetails,
+  AdminMonitoringRow,
+  AdminPage,
+  AdminToolCall,
+  AdminWebhookEvent,
+  AdminWebhookEventDetail,
+  BillingMe,
 } from './types';
-import { http, setElevationToken, getUserRole } from '@/lib/http';
+import { ApiError, http, setElevationToken, getUserRole } from '@/lib/http';
+import { TENANT_ID } from './util';
 
 export function isMockMode(): boolean {
   if (process.env.NEXT_PUBLIC_API_MODE === 'mock') {
@@ -27,6 +38,30 @@ async function loadMockData(): Promise<MockData> {
     throw new Error('Mock data cannot be loaded outside mock mode.');
   }
   return (await import('./mock')).MOCK;
+}
+
+function currentApiRole(): ReturnType<typeof getUserRole> {
+  if (isMockMode() && typeof document !== 'undefined') {
+    const roleCookie = document.cookie.split('; ').find((cookie) => cookie.startsWith('tk_role='));
+    if (roleCookie) {
+      const role = roleCookie.slice('tk_role='.length);
+      if (role === 'admin' || role === 'staff' || role === 'super_admin') return role;
+    }
+  }
+  return getUserRole();
+}
+
+function assertSuperAdminAccess(): void {
+  if (currentApiRole() !== 'super_admin') {
+    throw new ApiError('Super Admin access is required.', 403, 'FORBIDDEN');
+  }
+}
+
+function assertTenantAccess(): void {
+  const role = currentApiRole();
+  if (role !== 'admin' && role !== 'staff') {
+    throw new ApiError('Client access is required.', 403, 'FORBIDDEN');
+  }
 }
 
 // ---------------- ADAPTERS ----------------
@@ -72,6 +107,12 @@ function adaptAppointment(b: any): Appointment {
 }
 
 function adaptCall(b: any): Call {
+  const transcript = Array.isArray(b.transcript)
+    ? b.transcript
+    : typeof b.transcript === 'string' && b.transcript.trim()
+      ? [{ speaker: 'Transcript', text: b.transcript, time: '' }]
+      : undefined;
+
   return {
     id: String(b.id),
     customer_name: b.customer?.name || b.customer_name || 'Customer',
@@ -83,7 +124,7 @@ function adaptCall(b: any): Call {
     summary: b.summary || undefined,
     has_recording: Boolean(b.has_recording),
     recording_url: b.recording_url || undefined,
-    transcript: Array.isArray(b.transcript) ? b.transcript : undefined,
+    transcript,
   };
 }
 
@@ -100,6 +141,10 @@ function adaptAgent(b: any): Agent {
     online,
     calls_today: b.calls_today || 0,
     business_id: String(b.client_id || b.business_id || ''),
+    provider: b.provider || undefined,
+    provider_agent_id: b.provider_agent_id ?? null,
+    status: b.status || (online ? 'active' : 'inactive'),
+    tool_token_exists: b.tool_token_exists,
   };
 }
 
@@ -166,11 +211,12 @@ export async function fetchInitialDashboardData(): Promise<MockData> {
     return structuredClone(await loadMockData());
   }
 
-  const role = getUserRole();
+  const role = currentApiRole();
   const isSuperAdmin = role === 'super_admin';
+  if (isSuperAdmin) assertSuperAdminAccess();
 
   // Base endpoints for active client member / admin
-  const apptsPromise = http<any[]>('/api/v1/appointments?limit=100');
+  const apptsPromise = http<any[]>('/api/v1/appointments?limit=100&order=desc');
   const agentsPromise = isSuperAdmin
     ? http<any[]>('/api/v1/admin/agents')
     : http<any[]>('/api/v1/agents');
@@ -256,7 +302,7 @@ export async function fetchAppointments(): Promise<Appointment[]> {
     return structuredClone(mock.appts);
   }
 
-  const rawAppts = await http<any[]>('/api/v1/appointments?limit=100');
+  const rawAppts = await http<any[]>('/api/v1/appointments?limit=100&order=desc');
   return (rawAppts || []).map(adaptAppointment);
 }
 
@@ -282,8 +328,13 @@ export async function createAppointment(payload: Partial<Appointment> & { actor?
     return newAppt;
   }
 
+  const customerId = Number(payload.customer_id);
+  if (!Number.isSafeInteger(customerId) || customerId <= 0) {
+    throw new Error('Select a valid customer before booking the appointment.');
+  }
+
   const body = {
-    customer_id: Number(payload.customer_id) || 1,
+    customer_id: customerId,
     appointment_date: payload.date,
     appointment_time: payload.time ? payload.time.slice(0, 5) : '10:00',
     status: payload.status || 'scheduled',
@@ -381,28 +432,301 @@ export async function fetchCalls(): Promise<Call[]> {
   return (res || []).map(adaptCall);
 }
 
+export async function fetchCallDetails(id: string): Promise<Call> {
+  if (isMockMode()) {
+    const MOCK = await loadMockData();
+    const call = MOCK.calls.find((item) => item.id === id);
+    if (!call) throw new Error('Call details not found.');
+    return call;
+  }
+
+  const res = await http<any>(`/api/v1/calls/${encodeURIComponent(id)}`);
+  return adaptCall(res);
+}
+
 export async function fetchAgents(): Promise<Agent[]> {
   if (isMockMode()) {
     const MOCK = await loadMockData();
-    return MOCK.agents;
+    const role = currentApiRole();
+    if (role === 'super_admin') return MOCK.agents;
+    if (role !== 'admin' && role !== 'staff') {
+      throw new ApiError('A signed-in dashboard role is required.', 403, 'FORBIDDEN');
+    }
+    return MOCK.agents.filter((agent) => agent.business_id === TENANT_ID);
   }
-  const role = getUserRole();
+  const role = currentApiRole();
+  if (role !== 'super_admin' && role !== 'admin' && role !== 'staff') {
+    throw new ApiError('A signed-in dashboard role is required.', 403, 'FORBIDDEN');
+  }
   const endpoint = role === 'super_admin' ? '/api/v1/admin/agents' : '/api/v1/agents';
   const res = await http<any[]>(endpoint);
   return (res || []).map(adaptAgent);
 }
 
+export interface AdminAgentInput {
+  name: string;
+  provider: 'sarvam';
+  provider_agent_id: string;
+  phone_number: string;
+}
+
+function validateAdminAgentInput(input: AdminAgentInput): void {
+  if (!input.name.trim() || input.name.trim().length > 150) {
+    throw new ApiError('Enter an agent name between 1 and 150 characters.', 422, 'VALIDATION_ERROR');
+  }
+  if (!input.provider_agent_id.trim() || input.provider_agent_id.trim().length > 255) {
+    throw new ApiError('Enter a provider agent ID between 1 and 255 characters.', 422, 'VALIDATION_ERROR');
+  }
+  if (!/^\+[1-9]\d{6,14}$/.test(input.phone_number)) {
+    throw new ApiError('Enter a valid E.164 phone number, for example +919876543210.', 422, 'VALIDATION_ERROR');
+  }
+}
+
+function normalizedPhone(value: string): string {
+  return value.replace(/[^\d+]/g, '');
+}
+
+export function adminAgentErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.code === 'AGENT_ID_IN_USE') return 'That Sarvam agent ID is already linked to another client.';
+    if (error.code === 'PHONE_IN_USE') return 'That phone number is already assigned to another agent.';
+    if (error.code === 'VALIDATION_ERROR') return error.message;
+    if (error.status === 422) return 'Check the agent name, provider agent ID, and E.164 phone number.';
+    if (error.status === 403) return 'Super Admin access is required for agent management.';
+    return error.message;
+  }
+  return error instanceof Error ? error.message : 'Unable to save the agent.';
+}
+
+export async function fetchAdminIntegration(clientId: string): Promise<AdminClientIntegration> {
+  assertSuperAdminAccess();
+  if (isMockMode()) {
+    const { MOCK_CLIENT_INTEGRATIONS } = await import('./mock');
+    const MOCK = await loadMockData();
+    const integration = MOCK_CLIENT_INTEGRATIONS[clientId];
+    if (!integration) throw new ApiError('Client integration not found.', 404, 'CLIENT_NOT_FOUND');
+    return {
+      ...structuredClone(integration),
+      agents: MOCK.agents
+        .filter((agent) => agent.business_id === clientId)
+        .map((agent) => ({
+          id: agent.id,
+          name: agent.name,
+          provider: agent.provider || 'sarvam',
+          provider_agent_id: agent.provider_agent_id ?? null,
+          phone_number: agent.phone || null,
+          status: agent.status || (agent.online ? 'active' : 'inactive'),
+        })),
+    };
+  }
+  const integration = await http<AdminClientIntegration>(`/api/v1/admin/clients/${encodeURIComponent(clientId)}/integration`);
+  return {
+    ...integration,
+    agents: integration.agents.map((agent) => ({ ...agent, id: String(agent.id) })),
+  };
+}
+
+export async function fetchAdminAgentLinks(): Promise<Agent[]> {
+  assertSuperAdminAccess();
+  if (isMockMode()) {
+    const MOCK = await loadMockData();
+    const { MOCK_CLIENT_INTEGRATIONS } = await import('./mock');
+    return structuredClone(MOCK.agents).map((agent) => ({
+      ...agent,
+      tool_token_exists: MOCK_CLIENT_INTEGRATIONS[agent.business_id]?.credential_exists ?? false,
+    }));
+  }
+
+  const rawAgents = await http<any[]>('/api/v1/admin/agents');
+  const agents = (rawAgents || []).map(adaptAgent);
+  const clientIds = [...new Set(agents.map((agent) => agent.business_id))];
+  const integrations = await Promise.all(clientIds.map(async (clientId) => [
+    clientId,
+    await fetchAdminIntegration(clientId),
+  ] as const));
+  const byAgentId = new Map<string, { provider: string; provider_agent_id: string | null; phone_number: string | null; status: string; tool_token_exists: boolean }>();
+  const tokenExistsByClient = new Map<string, boolean>();
+  for (const [clientId, integration] of integrations) {
+    tokenExistsByClient.set(clientId, integration.credential_exists);
+    for (const linked of integration.agents) {
+      byAgentId.set(linked.id, {
+        provider: linked.provider,
+        provider_agent_id: linked.provider_agent_id,
+        phone_number: linked.phone_number,
+        status: linked.status,
+        tool_token_exists: integration.credential_exists,
+      });
+    }
+  }
+  return agents.map((agent) => {
+    const details = byAgentId.get(agent.id);
+    return {
+      ...agent,
+      provider: details?.provider,
+      provider_agent_id: details?.provider_agent_id ?? null,
+      phone: details?.phone_number ?? agent.phone,
+      status: details?.status ?? agent.status,
+      online: details ? details.status === 'active' : agent.online,
+      tool_token_exists: details?.tool_token_exists ?? tokenExistsByClient.get(agent.business_id) ?? false,
+    };
+  });
+}
+
+export async function linkAdminAgent(clientId: string, input: AdminAgentInput): Promise<Agent> {
+  assertSuperAdminAccess();
+  validateAdminAgentInput(input);
+  if (isMockMode()) {
+    const MOCK = await loadMockData();
+    const { MOCK_CLIENT_INTEGRATIONS } = await import('./mock');
+    if (MOCK.agents.some((agent) => agent.provider_agent_id === input.provider_agent_id.trim())) {
+      throw new ApiError('Provider agent ID is already in use.', 409, 'AGENT_ID_IN_USE');
+    }
+    if (MOCK.agents.some((agent) => normalizedPhone(agent.phone) === input.phone_number)) {
+      throw new ApiError('Phone number is already in use.', 409, 'PHONE_IN_USE');
+    }
+    if (!MOCK.businesses.some((business) => business.id === clientId)) {
+      throw new ApiError('Client not found.', 404, 'CLIENT_NOT_FOUND');
+    }
+    const agent: Agent = {
+      id: `g${Date.now()}-${MOCK.agents.length}`,
+      name: input.name.trim(),
+      languages: 'English',
+      phone: input.phone_number,
+      online: true,
+      calls_today: 0,
+      business_id: clientId,
+      provider: 'sarvam',
+      provider_agent_id: input.provider_agent_id.trim(),
+      status: 'active',
+    };
+    MOCK.agents.push(agent);
+    MOCK_CLIENT_INTEGRATIONS[clientId] ??= {
+      signed_event_webhook_url: '/api/v1/webhooks/sarvam',
+      tool_url_patterns: {},
+      urls_are_absolute: false,
+      credential_exists: false,
+      credential_created_at: null,
+      credential_rotated_at: null,
+      credential_last_used_at: null,
+      agents: [],
+    };
+    return agent;
+  }
+  const response = await http<any>(`/api/v1/admin/clients/${encodeURIComponent(clientId)}/agents`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+  return adaptAgent(response);
+}
+
+export async function updateAdminAgent(agentId: string, input: AdminAgentInput): Promise<Agent> {
+  assertSuperAdminAccess();
+  validateAdminAgentInput(input);
+  if (isMockMode()) {
+    const MOCK = await loadMockData();
+    const agent = MOCK.agents.find((item) => item.id === agentId);
+    if (!agent) throw new ApiError('Agent not found.', 404, 'AGENT_NOT_FOUND');
+    if (MOCK.agents.some((item) => item.id !== agentId && item.provider_agent_id === input.provider_agent_id.trim())) {
+      throw new ApiError('Provider agent ID is already in use.', 409, 'AGENT_ID_IN_USE');
+    }
+    if (MOCK.agents.some((item) => item.id !== agentId && normalizedPhone(item.phone) === input.phone_number)) {
+      throw new ApiError('Phone number is already in use.', 409, 'PHONE_IN_USE');
+    }
+    Object.assign(agent, {
+      name: input.name.trim(),
+      provider: 'sarvam',
+      provider_agent_id: input.provider_agent_id.trim(),
+      phone: input.phone_number,
+    });
+    return agent;
+  }
+  const response = await http<any>(`/api/v1/admin/agents/${encodeURIComponent(agentId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  });
+  return adaptAgent(response);
+}
+
+export async function unlinkAdminAgent(agentId: string): Promise<Agent> {
+  assertSuperAdminAccess();
+  if (isMockMode()) {
+    const MOCK = await loadMockData();
+    const agent = MOCK.agents.find((item) => item.id === agentId);
+    if (!agent) throw new ApiError('Agent not found.', 404, 'AGENT_NOT_FOUND');
+    agent.online = false;
+    agent.status = 'inactive';
+    return agent;
+  }
+  const response = await http<any>(`/api/v1/admin/agents/${encodeURIComponent(agentId)}/unlink`, { method: 'POST' });
+  return adaptAgent(response);
+}
+
+export async function createClientToolToken(clientId: string): Promise<AdminClientToolToken> {
+  assertSuperAdminAccess();
+  if (isMockMode()) {
+    const { MOCK_CLIENT_INTEGRATIONS } = await import('./mock');
+    const integration = MOCK_CLIENT_INTEGRATIONS[clientId];
+    if (!integration) throw new ApiError('Client integration not found.', 404, 'CLIENT_NOT_FOUND');
+    const token = `mock_${crypto.randomUUID().replace(/-/g, '')}`;
+    const now = new Date().toISOString();
+    const rotating = integration.credential_exists;
+    integration.credential_exists = true;
+    if (rotating) integration.credential_rotated_at = now;
+    else integration.credential_created_at = now;
+    return {
+      token,
+      urls_are_absolute: false,
+      tool_urls: Object.fromEntries(
+        Object.entries(integration.tool_url_patterns).map(([action, url]) => [action, url.replace('{TOKEN}', token)]),
+      ),
+    };
+  }
+  return http<AdminClientToolToken>(`/api/v1/admin/clients/${encodeURIComponent(clientId)}/tool-token`, { method: 'POST' });
+}
+
+export async function fetchBillingMe(): Promise<BillingMe> {
+  assertTenantAccess();
+  if (isMockMode()) {
+    return {
+      plan: 'Growth',
+      billing_cycle: 'monthly',
+      minutes_limit: 300,
+      minutes_used: 186,
+      minutes_remaining: 114,
+      usage_percent: 62,
+      alert: 'none',
+      renews_on: '2026-11-24',
+      next_payment_amount: 3499,
+    };
+  }
+  return http<BillingMe>('/api/v1/billing/me');
+}
+
 export async function toggleAgentPower(id: string, online?: boolean, actor?: string): Promise<Agent> {
   if (isMockMode()) {
     const MOCK = await loadMockData();
-    const agent = MOCK.agents.find((a) => a.id === id) || MOCK.agents[0];
-    return { ...agent, online: online ?? !agent.online };
+    const role = currentApiRole();
+    if (role !== 'super_admin' && role !== 'admin' && role !== 'staff') {
+      throw new ApiError('A signed-in dashboard role is required.', 403, 'FORBIDDEN');
+    }
+    const agent = MOCK.agents.find((a) => a.id === id);
+    if (!agent) throw new ApiError('Agent not found.', 404, 'AGENT_NOT_FOUND');
+    if (role !== 'super_admin' && agent.business_id !== TENANT_ID) {
+      throw new ApiError('Agent not found.', 404, 'AGENT_NOT_FOUND');
+    }
+    agent.online = online ?? !agent.online;
+    agent.status = agent.online ? 'active' : 'inactive';
+    return agent;
   }
 
-  const role = getUserRole();
+  const role = currentApiRole();
   const isSuperAdmin = role === 'super_admin';
+  if (!isSuperAdmin && role !== 'admin' && role !== 'staff') {
+    throw new ApiError('A signed-in dashboard role is required.', 403, 'FORBIDDEN');
+  }
 
   if (isSuperAdmin) {
+    assertSuperAdminAccess();
     const res = await http<any>(`/api/v1/admin/agents/${id}/power`, {
       method: 'PATCH',
       body: JSON.stringify({ online: Boolean(online) }),
@@ -457,6 +781,7 @@ export async function updateBusinessSettings(payload: {
 // ---------------- SUPER ADMIN ----------------
 
 export async function fetchAdminBusinesses(): Promise<Business[]> {
+  assertSuperAdminAccess();
   if (isMockMode()) {
     const MOCK = await loadMockData();
     return MOCK.businesses;
@@ -466,6 +791,7 @@ export async function fetchAdminBusinesses(): Promise<Business[]> {
 }
 
 export async function updateBusinessStatus(id: string, status: 'Active' | 'Suspended', actor?: string): Promise<any> {
+  assertSuperAdminAccess();
   if (isMockMode()) {
     return { success: true };
   }
@@ -475,20 +801,26 @@ export async function updateBusinessStatus(id: string, status: 'Active' | 'Suspe
   });
 }
 
-export async function addMinutePack(id: string, minutes: number = 100, actor?: string): Promise<Business> {
+export async function addMinutePack(
+  id: string,
+  minutes: number = 100,
+  actor?: string
+): Promise<{ success: boolean; minutes_added: number; client_id: string | number }> {
+  assertSuperAdminAccess();
   if (isMockMode()) {
     const MOCK = await loadMockData();
     const biz = MOCK.businesses.find((b) => b.id === id) || MOCK.businesses[0];
-    return { ...biz, minutes_limit: biz.minutes_limit + minutes };
+    biz.minutes_limit += minutes;
+    return { success: true, minutes_added: minutes, client_id: id };
   }
-  const res = await http<any>(`/api/v1/admin/businesses/${id}/minute-pack`, {
+  return http<{ success: boolean; minutes_added: number; client_id: string | number }>(`/api/v1/admin/businesses/${id}/minute-pack`, {
     method: 'POST',
     body: JSON.stringify({ minutes, actor }),
   });
-  return adaptBusiness(res);
 }
 
 export async function viewBusinessPin(id: string, actor?: string): Promise<{ pin: string; changedAt: string }> {
+  assertSuperAdminAccess();
   if (isMockMode()) {
     await loadMockData();
     return { pin: '4321', changedAt: new Date().toISOString() };
@@ -500,6 +832,7 @@ export async function viewBusinessPin(id: string, actor?: string): Promise<{ pin
 }
 
 export async function resetBusinessPin(id: string, actor?: string, pin?: string): Promise<{ pin: string }> {
+  assertSuperAdminAccess();
   if (isMockMode()) {
     await loadMockData();
     return { pin: pin ?? '' };
@@ -511,6 +844,7 @@ export async function resetBusinessPin(id: string, actor?: string, pin?: string)
 }
 
 export async function fetchAccessRequests(): Promise<AccessRequest[]> {
+  assertSuperAdminAccess();
   if (isMockMode()) {
     const MOCK = await loadMockData();
     return MOCK.requests;
@@ -519,20 +853,28 @@ export async function fetchAccessRequests(): Promise<AccessRequest[]> {
   return (res || []).map(adaptAccessRequest);
 }
 
-export async function approveAccess(id: string, actor?: string): Promise<Business> {
+export async function approveAccess(
+  id: string,
+  actor?: string
+): Promise<{ id: string; business: string; status: string; reason?: string }> {
+  assertSuperAdminAccess();
   if (isMockMode()) {
     const MOCK = await loadMockData();
-    const biz = MOCK.businesses.find((b) => b.id === id) || MOCK.businesses[0];
-    return { ...biz, status: 'Active' };
+    const request = MOCK.requests.find((item) => item.id === id);
+    if (request) request.status = 'Active';
+    const business = request?.business || 'Business';
+    const biz = MOCK.businesses.find((item) => item.name === business);
+    if (biz) biz.status = 'Active';
+    return { id, business, status: 'active', reason: 'Access approved' };
   }
-  const res = await http<any>(`/api/v1/admin/access/${id}/approve`, {
+  return http<{ id: string; business: string; status: string; reason?: string }>(`/api/v1/admin/access/${id}/approve`, {
     method: 'POST',
     body: JSON.stringify({ actor }),
   });
-  return adaptBusiness(res);
 }
 
 export async function declineAccess(id: string, reason = 'Payment declined', actor?: string): Promise<void> {
+  assertSuperAdminAccess();
   if (isMockMode()) {
     return;
   }
@@ -543,6 +885,7 @@ export async function declineAccess(id: string, reason = 'Payment declined', act
 }
 
 export async function fetchContactMessages(): Promise<ContactMessage[]> {
+  assertSuperAdminAccess();
   if (isMockMode()) {
     const MOCK = await loadMockData();
     return MOCK.messages;
@@ -551,6 +894,7 @@ export async function fetchContactMessages(): Promise<ContactMessage[]> {
 }
 
 export async function updateContactMessage(id: string, patch: Partial<ContactMessage>): Promise<ContactMessage> {
+  assertSuperAdminAccess();
   if (isMockMode()) {
     const MOCK = await loadMockData();
     const msg = MOCK.messages.find((m) => m.id === id) || MOCK.messages[0];
@@ -563,11 +907,195 @@ export async function updateContactMessage(id: string, patch: Partial<ContactMes
 }
 
 export async function fetchLogs(): Promise<LogEntry[]> {
+  assertSuperAdminAccess();
   if (isMockMode()) {
     const MOCK = await loadMockData();
     return MOCK.logs;
   }
   return http<LogEntry[]>('/api/v1/admin/logs');
+}
+
+export interface AdminListFilters {
+  page?: number;
+  limit?: number;
+  client_id?: number;
+  status?: string;
+  event_type?: string;
+  tool?: string;
+  success?: boolean;
+  source?: string;
+  date_from?: string;
+  date_to?: string;
+}
+
+interface ApiPaginated<T> {
+  success: boolean;
+  data: T[];
+  pagination: { page: number; limit: number; total: number };
+}
+
+function assertAdminAccess(): void {
+  assertSuperAdminAccess();
+}
+
+function buildAdminQuery(filters: AdminListFilters): string {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== '') query.set(key, String(value));
+  }
+  const encoded = query.toString();
+  return encoded ? `?${encoded}` : '';
+}
+
+function pageResult<T>(items: T[], filters: AdminListFilters, total = items.length): AdminPage<T> {
+  return {
+    items,
+    page: filters.page ?? 1,
+    limit: filters.limit ?? 10,
+    total,
+  };
+}
+
+function localDate(value: string): string {
+  return value.slice(0, 10);
+}
+
+function sanitizeWebhookPayload(payload: unknown): Record<string, unknown> {
+  const sanitized = sanitizeWebhookValue(payload);
+  return sanitized && typeof sanitized === 'object' && !Array.isArray(sanitized)
+    ? sanitized as Record<string, unknown>
+    : {};
+}
+
+function sanitizeWebhookValue(value: unknown, key = ''): unknown {
+  if (Array.isArray(value)) return value.map((item) => sanitizeWebhookValue(item, key));
+  if (value && typeof value === 'object') {
+    const sanitized: Record<string, unknown> = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      if (!/token|secret|password|authorization|api_key|signature/i.test(childKey)) {
+        sanitized[childKey] = sanitizeWebhookValue(childValue, childKey);
+      }
+    }
+    return sanitized;
+  }
+  if (typeof value === 'number' && /phone|mobile|telephone|tel/i.test(key)) {
+    return `******${String(value).replace(/\D/g, '').slice(-4)}`;
+  }
+  if (typeof value !== 'string') return value;
+  if (/phone|mobile|telephone|tel/i.test(key)) {
+    const digits = value.replace(/\D/g, '');
+    return `******${digits.slice(-4)}`;
+  }
+  if (/^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(value)) return value;
+  return value.replace(/(?:\+?\d[\d\s().-]{5,}\d)/g, (phone) => {
+    const digits = phone.replace(/\D/g, '');
+    return digits.length >= 7 && digits.length <= 15 ? `******${digits.slice(-4)}` : phone;
+  });
+}
+
+export async function fetchAdminWebhookEvents(
+  filters: AdminListFilters = {},
+): Promise<AdminPage<AdminWebhookEvent>> {
+  assertAdminAccess();
+  if (isMockMode()) {
+    const { MOCK_LOGWATCH } = await import('./mock');
+    let rows = structuredClone(MOCK_LOGWATCH.webhookEvents);
+    if (filters.client_id !== undefined) rows = rows.filter((row) => row.client_id === filters.client_id);
+    if (filters.status) rows = rows.filter((row) => row.status === filters.status);
+    if (filters.event_type) rows = rows.filter((row) => row.event_type === filters.event_type);
+    if (filters.date_from) rows = rows.filter((row) => localDate(row.created_at) >= filters.date_from!);
+    if (filters.date_to) rows = rows.filter((row) => localDate(row.created_at) <= filters.date_to!);
+    return mockPage(rows, filters);
+  }
+  return fetchAdminPage<AdminWebhookEvent>('/api/v1/admin/webhook-events', filters);
+}
+
+export async function fetchAdminWebhookEvent(id: number): Promise<AdminWebhookEventDetail> {
+  assertAdminAccess();
+  if (isMockMode()) {
+    const { MOCK_LOGWATCH } = await import('./mock');
+    const row = MOCK_LOGWATCH.webhookEventDetails[id];
+    if (!row) throw new Error('Webhook event not found.');
+    return { ...structuredClone(row), payload: sanitizeWebhookPayload(row.payload) };
+  }
+  const event = await http<AdminWebhookEventDetail>(`/api/v1/admin/webhook-events/${encodeURIComponent(id)}`);
+  return { ...event, payload: sanitizeWebhookPayload(event.payload) };
+}
+
+export async function fetchAdminToolCalls(
+  filters: AdminListFilters = {},
+): Promise<AdminPage<AdminToolCall>> {
+  assertAdminAccess();
+  if (isMockMode()) {
+    const { MOCK_LOGWATCH } = await import('./mock');
+    let rows = structuredClone(MOCK_LOGWATCH.toolCalls);
+    if (filters.client_id !== undefined) rows = rows.filter((row) => row.client_id === filters.client_id);
+    if (filters.tool) rows = rows.filter((row) => row.tool === filters.tool);
+    if (filters.success !== undefined) rows = rows.filter((row) => row.success === filters.success);
+    if (filters.date_from) rows = rows.filter((row) => localDate(row.created_at) >= filters.date_from!);
+    if (filters.date_to) rows = rows.filter((row) => localDate(row.created_at) <= filters.date_to!);
+    return mockPage(rows, filters);
+  }
+  return fetchAdminPage<AdminToolCall>('/api/v1/admin/tool-calls', filters);
+}
+
+export async function fetchAdminAppointments(
+  filters: AdminListFilters = {},
+): Promise<AdminPage<AdminAppointment>> {
+  assertAdminAccess();
+  if (isMockMode()) {
+    const { MOCK_LOGWATCH } = await import('./mock');
+    let rows = structuredClone(MOCK_LOGWATCH.appointments);
+    if (filters.client_id !== undefined) rows = rows.filter((row) => row.client_id === filters.client_id);
+    if (filters.status) rows = rows.filter((row) => row.status === filters.status);
+    if (filters.source) rows = rows.filter((row) => row.source === filters.source);
+    if (filters.date_from) rows = rows.filter((row) => row.date >= filters.date_from!);
+    if (filters.date_to) rows = rows.filter((row) => row.date <= filters.date_to!);
+    return mockPage(rows, filters);
+  }
+  return fetchAdminPage<AdminAppointment>('/api/v1/admin/appointments', filters);
+}
+
+export async function fetchAdminMonitoring(
+  filters: Pick<AdminListFilters, 'page' | 'limit'> = {},
+): Promise<AdminPage<AdminMonitoringRow>> {
+  assertAdminAccess();
+  if (isMockMode()) {
+    const { MOCK_LOGWATCH } = await import('./mock');
+    return mockPage(structuredClone(MOCK_LOGWATCH.monitoring), filters);
+  }
+  return fetchAdminPage<AdminMonitoringRow>('/api/v1/admin/monitoring', filters);
+}
+
+export async function fetchAdminHealthDetails(): Promise<AdminHealthDetails> {
+  assertAdminAccess();
+  if (isMockMode()) {
+    const { MOCK_LOGWATCH } = await import('./mock');
+    return structuredClone(MOCK_LOGWATCH.health);
+  }
+  return http<AdminHealthDetails>('/api/v1/admin/health/details');
+}
+
+function mockPage<T>(rows: T[], filters: AdminListFilters): AdminPage<T> {
+  const page = filters.page ?? 1;
+  const limit = filters.limit ?? 10;
+  const start = (page - 1) * limit;
+  return pageResult(rows.slice(start, start + limit), filters, rows.length);
+}
+
+async function fetchAdminPage<T>(
+  path: string, filters: AdminListFilters,
+): Promise<AdminPage<T>> {
+  const response = await http<ApiPaginated<T>>(
+    `${path}${buildAdminQuery({ page: 1, limit: 10, ...filters })}`,
+    { unwrapResponse: false },
+  );
+  return {
+    items: response.data,
+    page: response.pagination.page,
+    limit: response.pagination.limit,
+    total: response.pagination.total,
+  };
 }
 
 // ---------------- STAFF ADMIN PIN ----------------

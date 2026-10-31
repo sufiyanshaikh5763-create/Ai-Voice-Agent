@@ -139,10 +139,14 @@ function onRefreshFailed(err: any) {
 export interface RequestOptions extends RequestInit {
   requiresAuth?: boolean;
   retryOnExpire?: boolean;
+  unwrapResponse?: boolean;
 }
 
 export async function http<T = any>(endpoint: string, options: RequestOptions = {}): Promise<T> {
-  const { requiresAuth = true, retryOnExpire = true, headers: customHeaders, ...fetchOpts } = options;
+  const {
+    requiresAuth = true, retryOnExpire = true, unwrapResponse = true,
+    headers: customHeaders, ...fetchOpts
+  } = options;
 
   const url = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
   const headers = new Headers(customHeaders || {});
@@ -274,6 +278,10 @@ export async function http<T = any>(endpoint: string, options: RequestOptions = 
       }
     }
     throw new ApiError(errorMsg, response.status, errorCode);
+  }
+
+  if (!unwrapResponse) {
+    return data as T;
   }
 
   // Unwrap ApiResponse envelope if present

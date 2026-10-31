@@ -23,7 +23,7 @@ from app.models.enums import (AccessStatus, BillingCycle, OnboardingStage,
 from app.models.payment import Payment
 from app.models.plan import Plan, Subscription
 from app.models.user import User
-from tests.helpers import (auth_headers, create_staff, register, register_ok)
+from tests.helpers import (auth_headers, create_staff, login_token, register, register_ok)
 
 
 # ---------------- 1. PAYMENTS (MANUAL UPI) ----------------
@@ -101,8 +101,8 @@ def test_manual_submit_payment_auth_and_roles(client, db):
     # 2. Client Staff -> 403 INSUFFICIENT_PERMISSIONS
     reg = register_ok(client, "admin_owner@test.com")
     admin_tok = reg["tokens"]["access_token"]
-    staff = create_staff(client, admin_tok, "staff_submitter@test.com")
-    staff_tok = staff["tokens"]["access_token"]
+    create_staff(client, admin_tok, "staff_submitter@test.com")
+    staff_tok = login_token(client, "staff_submitter@test.com")
 
     resp_staff = client.post(
         "/api/v1/payments/manual-submit",
@@ -116,7 +116,7 @@ def test_manual_submit_payment_auth_and_roles(client, db):
         },
     )
     assert resp_staff.status_code == 403
-    assert resp_staff.json()["code"] == "INSUFFICIENT_PERMISSIONS"
+    assert resp_staff.json()["error_code"] == "INSUFFICIENT_PERMISSIONS"
 
 
 def test_manual_submit_payment_email_verification_required(client, db):
@@ -188,7 +188,7 @@ def test_manual_submit_payment_amount_mismatch_and_validations(client, db):
         },
     )
     assert resp_short_tx.status_code == 400
-    assert resp_short_tx.json()["code"] == "INVALID_TRANSACTION_ID"
+    assert resp_short_tx.json()["error_code"] == "INVALID_TRANSACTION_ID"
 
     # 2. Future payment date
     tomorrow = str(date.today() + timedelta(days=1))
@@ -204,7 +204,7 @@ def test_manual_submit_payment_amount_mismatch_and_validations(client, db):
         },
     )
     assert resp_future_date.status_code == 400
-    assert resp_future_date.json()["code"] == "INVALID_PAYMENT_DATE"
+    assert resp_future_date.json()["error_code"] == "INVALID_PAYMENT_DATE"
 
     # 3. Invalid screenshot magic bytes
     bad_files = {"screenshot": ("virus.exe", io.BytesIO(b"MZ\x90\x00\x03\x00\x00\x00"), "application/octet-stream")}
@@ -221,7 +221,7 @@ def test_manual_submit_payment_amount_mismatch_and_validations(client, db):
         files=bad_files,
     )
     assert resp_bad_file.status_code == 400
-    assert resp_bad_file.json()["code"] == "INVALID_FILE_TYPE"
+    assert resp_bad_file.json()["error_code"] == "INVALID_FILE_TYPE"
 
     # 4. Amount mismatch: expected 5700, submitted 5000 -> stored with amount_mismatch=True
     resp_mismatch = client.post(
@@ -254,7 +254,7 @@ def test_manual_submit_payment_amount_mismatch_and_validations(client, db):
         },
     )
     assert resp_dup.status_code == 400
-    assert resp_dup.json()["code"] == "TRANSACTION_DUPLICATE"
+    assert resp_dup.json()["error_code"] == "TRANSACTION_DUPLICATE"
 
 
 # ---------------- 2. ONBOARDING STATUS ----------------
@@ -281,17 +281,18 @@ def test_onboarding_status_lifecycle_and_tenant_isolation(client, db):
     db_u.email_verified_at = datetime.now(timezone.utc)
     db.commit()
 
-    client.post(
+    resp_submit = client.post(
         "/api/v1/payments/manual-submit",
         headers=auth_headers(tok_a),
         data={
             "package_id": "starter",
             "billing_cycle": "monthly",
             "amount_paid": "2250",
-            "transaction_id": "TXN_ONBOARD_A",
+            "transaction_id": "TXNONBOARDA",
             "payment_date": str(date.today()),
         },
     )
+    assert resp_submit.status_code == 200, resp_submit.text
 
     resp_pend = client.get("/api/v1/onboarding/status", headers=auth_headers(tok_a))
     data_pend = resp_pend.json()
@@ -299,7 +300,7 @@ def test_onboarding_status_lifecycle_and_tenant_isolation(client, db):
     assert data_pend["onboardingStage"] == "awaiting_payment_verification"
     assert data_pend["packageName"] == "starter"
     assert data_pend["amount"] == 2250
-    assert data_pend["transactionRef"] == "TXN_ONBOARD_A"
+    assert data_pend["transactionRef"] == "TXNONBOARDA"
     assert data_pend["dashboardAccessGranted"] is False
 
     # 3. Simulate super_admin verifying payment and activating client

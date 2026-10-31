@@ -8,15 +8,12 @@ This repository contains the complete frontend solution:
 
 ---
 
-## ⚡ Quick Start (No Backend Required)
+## ⚡ Quick Start (Mock Demo)
 
-The dashboard is built to operate **100% independently** using a stateful, typed mock layer. You can demonstrate and test the full application immediately:
+The dashboard can run with demo data by setting `NEXT_PUBLIC_API_MODE=mock` in `.env.local`:
 
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Run development server
 npm run dev
 ```
 
@@ -182,17 +179,15 @@ The appointments view (`/dashboard/appointments`) features two presentation mode
 
 ### 1. Environment Variable Configuration
 
-Create a `.env.local` file at the root:
+Create `.env.local` in this frontend directory:
 
 ```env
-# URL where your colleague's FastAPI backend is running
-NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
-
-# Set to 'false' to switch from Mock mode to the Live FastAPI backend
-NEXT_PUBLIC_USE_MOCK=false
+# "mock" uses demo data; blank or "live" uses the real API.
+NEXT_PUBLIC_API_MODE=live
+BACKEND_INTERNAL_URL=http://127.0.0.1:8000
 ```
 
-When `NEXT_PUBLIC_USE_MOCK=false`, all requests pass through `lib/api/client.ts` to your FastAPI server. When `NEXT_PUBLIC_USE_MOCK=true` (or variable is absent), the frontend runs entirely in mock mode.
+Requests use the real FastAPI backend unless `NEXT_PUBLIC_API_MODE=mock`. See the repository-root `README.md` for the complete local setup steps.
 
 ### 2. Automatic Token Expiry & Refresh Handling (Requirement #20)
 

@@ -50,10 +50,11 @@ def test_date_filter_uses_client_timezone(client, db):
     tok, cid, _agent, _c = _setup(client, db)
     # 20:00 UTC on Jan 15 is 01:30 on Jan 16 in India.
     call = make_call(db, cid, started_at=utc(2030, 1, 15, 20, 0))
-    assert _ids(client, tok, "date=2030-01-15") == [call.id]  # tenant timezone is UTC by default
-    client.patch("/api/v1/clients/me", headers=auth_headers(tok), json={"timezone": "Asia/Kolkata"})
     assert _ids(client, tok, "date=2030-01-15") == []
     assert _ids(client, tok, "date=2030-01-16") == [call.id]
+    client.patch("/api/v1/clients/me", headers=auth_headers(tok), json={"timezone": "UTC"})
+    assert _ids(client, tok, "date=2030-01-15") == [call.id]
+    assert _ids(client, tok, "date=2030-01-16") == []
 
 
 def test_date_range_filter_and_fallback_to_created_at(client, db):

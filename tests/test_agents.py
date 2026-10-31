@@ -1,5 +1,5 @@
-from tests.helpers import (PASSWORD, auth_headers, create_agent, create_staff, login_token,
-                           register_ok)
+from tests.helpers import (PASSWORD, auth_headers, create_admin_agent, create_agent,
+                           create_staff, login_token, register_ok, super_admin_headers)
 
 
 def _admin(client):
@@ -34,38 +34,42 @@ def test_provider_agent_id_unique_platform_wide(client):
     a_token = _admin(client)
     b_token = register_ok(client, "admin@b.com", "Tenant B")["tokens"]["access_token"]
     create_agent(client, a_token, "A1", provider_agent_id="dup-ref")
-    resp = client.post("/api/v1/agents", headers=auth_headers(b_token),
-                       json={"name": "B1", "provider_agent_id": "dup-ref"})
-    assert resp.status_code == 409 and resp.json()["error_code"] == "AGENT_PROVIDER_REF_EXISTS"
+    b_id = client.get("/api/v1/clients/me", headers=auth_headers(b_token)).json()["data"]["id"]
+    resp = create_admin_agent(client, b_id, "B1", provider_agent_id="dup-ref")
+    assert resp.status_code == 409 and resp.json()["error_code"] == "AGENT_ID_IN_USE"
 
 
 def test_update_fields_and_config(client):
     token = _admin(client)
     agent = create_agent(client, token, configuration={"voice": "female"})
-    resp = client.patch(f"/api/v1/agents/{agent['id']}", headers=auth_headers(token), json={
-        "description": "Updated", "configuration": {"voice": "male"}, "status": "inactive"})
+    resp = client.patch(f"/api/v1/admin/agents/{agent['id']}",
+                        headers=super_admin_headers(client), json={
+        "name": "Zoya updated", "provider_agent_id": "agent-updated",
+        "status": "inactive"})
     assert resp.status_code == 200
     data = resp.json()["data"]
-    assert data["description"] == "Updated"
-    assert data["configuration"] == {"voice": "male"} and data["status"] == "inactive"
+    assert data["name"] == "Zoya updated"
+    assert data["provider_agent_id"] == "agent-updated" and data["status"] == "inactive"
+    assert data["configuration"] == {"voice": "female"}
 
 
 def test_update_to_taken_provider_ref_conflicts(client):
     token = _admin(client)
     create_agent(client, token, "A1", provider_agent_id="ref-1")
     a2 = create_agent(client, token, "A2", provider_agent_id="ref-2")
-    resp = client.patch(f"/api/v1/agents/{a2['id']}", headers=auth_headers(token),
+    resp = client.patch(f"/api/v1/admin/agents/{a2['id']}",
+                        headers=super_admin_headers(client),
                         json={"provider_agent_id": "ref-1"})
-    assert resp.status_code == 409
+    assert resp.status_code == 409 and resp.json()["error_code"] == "AGENT_ID_IN_USE"
 
 
-def test_update_null_clears_optional_fields_but_not_name(client):
+def test_admin_update_null_clears_optional_provider_id(client):
     token = _admin(client)
-    agent = create_agent(client, token, description="desc", provider_agent_id="ref-9")
-    resp = client.patch(f"/api/v1/agents/{agent['id']}", headers=auth_headers(token),
-                        json={"description": None, "provider_agent_id": None, "name": None})
+    agent = create_agent(client, token, provider_agent_id="ref-9")
+    resp = client.patch(f"/api/v1/admin/agents/{agent['id']}",
+                        headers=super_admin_headers(client), json={"provider_agent_id": None})
     data = resp.json()["data"]
-    assert data["description"] is None and data["provider_agent_id"] is None
+    assert data["provider_agent_id"] is None
     assert data["name"] == agent["name"]
 
 
@@ -83,9 +87,11 @@ def test_list_filters_and_pagination(client):
 def test_delete_agent(client):
     token = _admin(client)
     agent = create_agent(client, token)
-    h = auth_headers(token)
-    assert client.delete(f"/api/v1/agents/{agent['id']}", headers=h).status_code == 200
-    assert client.get(f"/api/v1/agents/{agent['id']}", headers=h).status_code == 404
+    resp = client.post(f"/api/v1/admin/agents/{agent['id']}/unlink",
+                       headers=super_admin_headers(client))
+    assert resp.status_code == 200 and resp.json()["data"]["status"] == "inactive"
+    assert client.get(f"/api/v1/agents/{agent['id']}",
+                      headers=auth_headers(token)).status_code == 200
 
 
 def test_staff_can_view_but_not_manage_agents(client):
@@ -133,6 +139,7 @@ def test_super_admin_lists_a_clients_agents(client, db):
 def test_update_phone_number_is_normalized(client):
     token = _admin(client)
     agent = create_agent(client, token, phone_number="+91 90000 00000")
-    resp = client.patch(f"/api/v1/agents/{agent['id']}", headers=auth_headers(token),
+    resp = client.patch(f"/api/v1/admin/agents/{agent['id']}",
+                        headers=super_admin_headers(client),
                         json={"phone_number": "+91 90000 00001"})
     assert resp.json()["data"]["phone_number"] == "+919000000001"

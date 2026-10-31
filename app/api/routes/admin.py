@@ -1,20 +1,32 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Query, Request, Response, status
 
+from app.core.config import get_settings
 from app.core.dependencies import DbSession, SuperAdminUser
 from app.core.rate_limit import limiter
+from app.models.enums import AppointmentStatus
 from app.schemas.admin import (AccessActionResponse, AccessDeclineRequest,
                                AccessRequestItem, AdminAgentItem,
-                               AdminBusinessItem, AdminMessageItem,
+                               AdminAppointmentItem, AdminBusinessItem,
+                               AdminHealthDetails, AdminMessageItem,
+                               AdminMonitoringItem, AdminToolCallItem,
+                               AdminWebhookEventDetail, AdminWebhookEventItem,
                                AdminMessageUpdateRequest, AdminUserResetPasswordRequest,
                                AgentPowerRequest, BusinessMinutePackRequest,
                                BusinessStatusUpdateRequest, LogItem,
                                PinResetRequest, PinResetResponse,
                                PinViewResponse)
+from app.schemas.agent import AgentOut
+from app.schemas.agent_link import (AdminAgentCreate, AdminAgentUpdate,
+                                    ClientIntegrationOut, ClientToolTokenOut)
 from app.schemas.user import UserOut, UserUpdate
+from app.services.admin_agent_service import AdminAgentService
 from app.services.admin_service import AdminService
+from app.services.client_tool_credential_service import ClientToolCredentialService
+from app.schemas.common import ApiResponse, PaginatedResponse
+from app.utils.pagination import PageParamsDep, paginated
 
 router = APIRouter()
 
@@ -92,6 +104,63 @@ def list_all_agents(user: SuperAdminUser, db: DbSession):
     return AdminService(db).get_agents()
 
 
+@router.post(
+    "/clients/{client_id}/agents",
+    response_model=ApiResponse[AgentOut],
+    status_code=status.HTTP_201_CREATED,
+)
+def create_client_agent(
+    client_id: int, body: AdminAgentCreate, request: Request,
+    user: SuperAdminUser, db: DbSession,
+):
+    agent = AdminAgentService(db).create(client_id, body, user, _ip(request))
+    return ApiResponse(message="Agent linked successfully",
+                        data=AgentOut.model_validate(agent))
+
+@router.patch("/agents/{agent_id}", response_model=ApiResponse[AgentOut])
+def update_agent_link(
+    agent_id: int, body: AdminAgentUpdate, request: Request,
+    user: SuperAdminUser, db: DbSession,
+):
+    agent = AdminAgentService(db).update(agent_id, body, user, _ip(request))
+    return ApiResponse(message="Agent updated successfully",
+                        data=AgentOut.model_validate(agent))
+
+
+@router.post("/agents/{agent_id}/unlink", response_model=ApiResponse[AgentOut])
+def unlink_agent(
+    agent_id: int, request: Request, user: SuperAdminUser, db: DbSession,
+):
+    agent = AdminAgentService(db).unlink(agent_id, user, _ip(request))
+    return ApiResponse(message="Agent unlinked successfully",
+                        data=AgentOut.model_validate(agent))
+
+@router.post(
+    "/clients/{client_id}/tool-token",
+    response_model=ApiResponse[ClientToolTokenOut],
+)
+def create_or_rotate_client_tool_token(
+    client_id: int, request: Request, user: SuperAdminUser, db: DbSession,
+):
+    result = ClientToolCredentialService(db).create_or_rotate(
+        client_id, user, _ip(request), get_settings().public_api_base_url
+    )
+    return ApiResponse(message="Client tool token created or rotated", data=result)
+
+
+@router.get(
+    "/clients/{client_id}/integration",
+    response_model=ApiResponse[ClientIntegrationOut],
+)
+def get_client_integration(
+    client_id: int, user: SuperAdminUser, db: DbSession,
+):
+    result = ClientToolCredentialService(db).integration(
+        client_id, get_settings().public_api_base_url
+    )
+    return ApiResponse(message="Client integration details retrieved", data=result)
+
+
 @router.patch("/agents/{agent_id}/power")
 def toggle_agent_power(
     agent_id: int, body: AgentPowerRequest, request: Request, user: SuperAdminUser, db: DbSession
@@ -163,3 +232,60 @@ def admin_reset_user_password(
     """Reset user password by super_admin. Protected accounts reject with 403."""
     AdminService(db).reset_user_password(target_user_id=user_id, new_password=body.new_password, user=user, ip=_ip(request))
     return {"message": "Password reset successfully"}
+
+
+# ---------------- 7. LOGWATCH ----------------
+
+@router.get("/webhook-events", response_model=PaginatedResponse[AdminWebhookEventItem])
+def list_webhook_events(
+    user: SuperAdminUser, db: DbSession, page: PageParamsDep,
+    status_filter: str | None = Query(None, alias="status"),
+    client_id: int | None = None, event_type: str | None = None,
+    date_from: datetime | None = None, date_to: datetime | None = None,
+):
+    items, total = AdminService(db).get_webhook_events(
+        page.offset, page.limit, status=status_filter, client_id=client_id,
+        event_type=event_type, date_from=date_from, date_to=date_to)
+    return paginated(items, total, page, AdminWebhookEventItem)
+
+
+@router.get("/webhook-events/{id}", response_model=AdminWebhookEventDetail)
+def get_webhook_event(id: int, user: SuperAdminUser, db: DbSession):
+    return AdminService(db).get_webhook_event(id)
+
+
+@router.get("/tool-calls", response_model=PaginatedResponse[AdminToolCallItem])
+def list_tool_calls(
+    user: SuperAdminUser, db: DbSession, page: PageParamsDep,
+    client_id: int | None = None, tool: str | None = None,
+    success: bool | None = None,
+    date_from: datetime | None = None, date_to: datetime | None = None,
+):
+    items, total = AdminService(db).get_tool_calls(
+        page.offset, page.limit, client_id=client_id, tool=tool, success=success,
+        date_from=date_from, date_to=date_to)
+    return paginated(items, total, page, AdminToolCallItem)
+
+
+@router.get("/appointments", response_model=PaginatedResponse[AdminAppointmentItem])
+def list_admin_appointments(
+    user: SuperAdminUser, db: DbSession, page: PageParamsDep,
+    client_id: int | None = None, status_filter: AppointmentStatus | None = Query(None, alias="status"),
+    source: str | None = Query(None, pattern="^(ai_agent|manual)$"),
+    date_from: date | None = None, date_to: date | None = None,
+):
+    items, total = AdminService(db).get_admin_appointments(
+        page.offset, page.limit, client_id=client_id, status=status_filter,
+        source=source, date_from=date_from, date_to=date_to)
+    return paginated(items, total, page, AdminAppointmentItem)
+
+
+@router.get("/monitoring", response_model=PaginatedResponse[AdminMonitoringItem])
+def admin_monitoring(user: SuperAdminUser, db: DbSession, page: PageParamsDep):
+    items, total = AdminService(db).get_monitoring(page.offset, page.limit)
+    return paginated(items, total, page, AdminMonitoringItem)
+
+
+@router.get("/health/details", response_model=AdminHealthDetails)
+def admin_health_details(user: SuperAdminUser, db: DbSession):
+    return AdminService(db).get_health_details()

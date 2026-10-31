@@ -67,6 +67,7 @@ class AdminAgentItem(BaseModel):
     name: str
     languages: list[str] = ["English"]
     phone: str | None = None
+    phone_number: str | None = None
     online: bool = True
     calls_today: int = 0
     business_id: int
@@ -101,3 +102,76 @@ class AdminMessageUpdateRequest(BaseModel):
 
 class AdminUserResetPasswordRequest(BaseModel):
     new_password: str
+
+
+class AdminWebhookEventItem(BaseModel):
+    id: int
+    provider: str
+    event_id: str
+    event_type: str
+    client_id: int | None = None
+    business_name: str | None = None
+    status: str
+    error_message: str | None = None
+    created_at: datetime
+    processed_at: datetime | None = None
+
+
+class AdminWebhookEventDetail(AdminWebhookEventItem):
+    payload: dict
+
+
+class AdminToolCallItem(BaseModel):
+    id: int
+    client_id: int | None = None
+    business_name: str | None = None
+    tool: str
+    action: str
+    tenant_resolution: str | None = None
+    success: bool
+    error_code: str | None = None
+    message: str | None = None
+    appointment_id: int | None = None
+    duration_ms: int
+    request_id: str | None = None
+    created_at: datetime
+
+
+class AdminAppointmentItem(BaseModel):
+    id: int
+    client_id: int
+    business_name: str
+    customer_name: str
+    date: date
+    time: str
+    status: str
+    source: str
+    created_at: datetime
+
+
+class AdminMonitoringItem(BaseModel):
+    client_id: int
+    business_name: str
+    access_status: str
+    agent_status: str | None = None
+    provider_agent_id_present: bool
+    last_call_time: datetime | None = None
+    minutes_used: int
+    minutes_limit: int
+    usage_percent: float
+    alert: str
+    failed_webhook_events_24h: int
+    last_webhook_received_at: datetime | None = None
+    last_tool_call_at: datetime | None = None
+    last_tool_call_error: str | None = None
+
+
+class AdminHealthDetails(BaseModel):
+    database_ok: bool
+    last_webhook_received_at: datetime | None = None
+    sarvam_api_key_set: bool
+    sarvam_base_url_set: bool
+    sarvam_webhook_secret_set: bool
+    email_backend: str
+    resend_api_key_set: bool
+    app_env_production: bool

@@ -6,12 +6,16 @@ anything else in it — so a malformed or malicious payload can't target another
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import AppError
 from app.integrations.sarvam.schemas import SarvamWebhookEnvelope
 from app.models.agent import Agent
+from app.models.client import Client
 from app.models.enums import CallDirection, CallStatus, WebhookEventStatus
 from app.models.webhook_event import WebhookEvent
 from app.repositories.call_repository import CallRepository
@@ -41,10 +45,12 @@ class WebhookService:
         self.db = db
 
     # ----- idempotency -----
-    def _claim_event(self, envelope: SarvamWebhookEnvelope, raw_payload: dict) -> WebhookEvent | None:
+    def _claim_event(self, envelope: SarvamWebhookEnvelope, raw_payload: dict,
+                     request_id: str | None = None) -> WebhookEvent | None:
         """Inserts the event row; returns None if this event_id was already seen."""
         event = WebhookEvent(provider=PROVIDER, event_id=envelope.event_id,
-                             event_type=envelope.event_type, payload=raw_payload)
+                             event_type=envelope.event_type, payload=raw_payload,
+                             request_id=request_id[:255] if request_id else None)
         self.db.add(event)
         try:
             self.db.flush()
@@ -54,15 +60,38 @@ class WebhookService:
         return event
 
     def _resolve_agent(self, provider_agent_id: str) -> Agent | None:
-        from sqlalchemy import select
-
         return self.db.scalar(select(Agent).where(
             Agent.provider == PROVIDER, Agent.provider_agent_id == provider_agent_id))
 
+    def _metadata_client_id(self, raw_payload: dict) -> int | None:
+        metadata = raw_payload.get("metadata")
+        if not isinstance(metadata, dict):
+            config = raw_payload.get("webhook_config")
+            metadata = config.get("metadata") if isinstance(config, dict) else None
+        if not isinstance(metadata, dict):
+            return None
+        raw_client_id = metadata.get("client_id", metadata.get("tenant_id"))
+        try:
+            client_id = int(raw_client_id) if raw_client_id is not None else None
+        except (TypeError, ValueError):
+            return None
+        return client_id if client_id is not None and self.db.get(Client, client_id) else None
+
     # ----- dispatch -----
-    def process(self, envelope: SarvamWebhookEnvelope, raw_payload: dict) -> WebhookOutcome:
-        event = self._claim_event(envelope, raw_payload)
+    def process(self, envelope: SarvamWebhookEnvelope, raw_payload: dict,
+                request_id: str | None = None) -> WebhookOutcome:
+        now = datetime.now(timezone.utc)
+        event = self._claim_event(envelope, raw_payload, request_id)
         if event is None:
+            event = self.db.scalar(select(WebhookEvent).where(
+                WebhookEvent.provider == PROVIDER,
+                WebhookEvent.event_id == envelope.event_id,
+            ))
+            if event is not None:
+                event.status = WebhookEventStatus.DUPLICATE
+                event.error_message = "Duplicate event"
+                event.processed_at = now
+                event.request_id = request_id[:255] if request_id else None
             self.db.commit()
             return WebhookOutcome(event_id=envelope.event_id, status=WebhookEventStatus.DUPLICATE,
                                   message="Event already processed")
@@ -71,6 +100,8 @@ class WebhookService:
         if agent is None:
             event.status = WebhookEventStatus.FAILED
             event.error_message = f"Unknown agent_id: {envelope.agent_id}"
+            event.client_id = self._metadata_client_id(raw_payload)
+            event.processed_at = now
             self.db.commit()
             return WebhookOutcome(event_id=envelope.event_id, status=WebhookEventStatus.FAILED,
                                   message="Unknown agent")
@@ -80,17 +111,30 @@ class WebhookService:
         except (AppError, WebhookProcessingError) as exc:
             self.db.rollback()
             # Re-fetch: the rollback above also undid the WebhookEvent insert.
-            event = self._claim_event(envelope, raw_payload)
+            event = self._claim_event(envelope, raw_payload, request_id)
             message = getattr(exc, "message", str(exc))
             if event is not None:
                 event.status = WebhookEventStatus.FAILED
                 event.error_message = message
+                event.client_id = agent.client_id
+                event.processed_at = datetime.now(timezone.utc)
             self.db.commit()
             return WebhookOutcome(event_id=envelope.event_id, status=WebhookEventStatus.FAILED,
                                   message=message)
+        except Exception:
+            self.db.rollback()
+            event = self._claim_event(envelope, raw_payload, request_id)
+            if event is not None:
+                event.status = WebhookEventStatus.FAILED
+                event.error_message = "Webhook processing error"
+                event.client_id = agent.client_id
+                event.processed_at = datetime.now(timezone.utc)
+            self.db.commit()
+            raise
 
         event.status = WebhookEventStatus.PROCESSED
         event.client_id = agent.client_id
+        event.processed_at = datetime.now(timezone.utc)
         self.db.commit()
         return WebhookOutcome(event_id=envelope.event_id, status=WebhookEventStatus.PROCESSED,
                               message="Event processed")

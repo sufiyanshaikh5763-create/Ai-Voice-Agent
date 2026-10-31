@@ -38,7 +38,8 @@ async def sarvam_webhook(request: Request,
     # A dedicated session: webhooks aren't part of the request-scoped get_db dependency chain,
     # so failures here never affect (or get rolled back by) unrelated requests.
     with SessionLocal() as db:
-        outcome = WebhookService(db).process(envelope, raw_payload)
+        outcome = WebhookService(db).process(
+            envelope, raw_payload, request_id=getattr(request.state, "request_id", None))
     if outcome.status.value == "failed":
         logger.warning("Sarvam webhook %s failed: %s", outcome.event_id, outcome.message)
     return ApiResponse(message=outcome.message, data=outcome)

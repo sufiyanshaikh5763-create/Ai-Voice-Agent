@@ -39,6 +39,12 @@ class PinService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
+    def encrypt_pin(self, pin: str) -> str:
+        return encrypt_pin(pin)
+
+    def decrypt_pin(self, encrypted_pin: str) -> str:
+        return get_fernet().decrypt(encrypted_pin.encode("utf-8")).decode("utf-8")
+
     def _check_locks_and_windows(
         self, client_id: int, user_id: int, now: datetime
     ) -> tuple[PinAttempt | None, PinAttempt | None]:

@@ -170,7 +170,11 @@ class TransactionDuplicateError(AppError):
     message = "Transaction ID already submitted"
 
     def __init__(self, message: str = "Transaction ID already submitted") -> None:
-        self.custom_body = {"detail": message, "code": "TRANSACTION_DUPLICATE"}
+        self.custom_body = {
+            "success": False,
+            "message": message,
+            "error_code": "TRANSACTION_DUPLICATE",
+        }
         super().__init__(message, error_code="TRANSACTION_DUPLICATE")
 
 
@@ -216,11 +220,24 @@ async def _validation_error(request: Request, exc: RequestValidationError) -> JS
         {"field": ".".join(str(p) for p in e["loc"] if p != "body"), "message": e["msg"]}
         for e in exc.errors()
     ]
+    if getattr(request.state, "sarvam_tool_token_valid", False):
+        try:
+            from app.services.tool_call_log_service import log_tool_validation_failure
+            log_tool_validation_failure(request)
+        except Exception:
+            logger.exception("Could not audit a validated Sarvam tool request failure")
     _log_rejected(request, 422, "VALIDATION_ERROR", errors, getattr(exc, "body", None))
     return JSONResponse(_error_body("Validation failed", "VALIDATION_ERROR", errors), 422)
 
 
-async def _http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    if exc.status_code == 404 and "/webhooks/sarvam//" in request.url.path:
+        try:
+            from app.services.tool_call_log_service import log_invalid_tool_token
+            log_invalid_tool_token(
+                "missing_token", request_id=getattr(request.state, "request_id", None))
+        except Exception:
+            logger.exception("Could not log a tokenless Sarvam tool request")
     if isinstance(exc.detail, dict):
         return JSONResponse(exc.detail, exc.status_code, headers=getattr(exc, "headers", None))
     code = _STATUS_CODES.get(exc.status_code, "HTTP_ERROR")

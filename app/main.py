@@ -13,6 +13,7 @@ from app.core.dependencies import SuperAdminUser
 from app.core.exceptions import register_exception_handlers
 from app.core.middleware import RequestIDMiddleware
 from app.core.rate_limit import limiter
+from app.services.email_service import warn_if_console_backend_in_production
 from app.otp_routes import router as otp_router
 
 
@@ -61,6 +62,7 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def on_startup() -> None:
+        warn_if_console_backend_in_production()
         from app.scripts.seed_super_admins import startup_seed_super_admins
         startup_seed_super_admins()
 

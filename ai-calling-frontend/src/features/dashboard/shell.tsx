@@ -13,6 +13,7 @@ import type { Role } from './types';
 const IDLE_WARNING_MS = 28 * 60 * 1000;
 const IDLE_LOGOUT_MS = 30 * 60 * 1000;
 const STAFF_ADMIN_IDLE_MS = 15 * 60 * 1000;
+const isDemoMode = process.env.NEXT_PUBLIC_API_MODE === 'mock';
 
 function IdleLogoutDialog({ onStay }: { onStay: () => void }) {
   const { logout } = useDash();
@@ -109,6 +110,10 @@ export function DashboardShell({ children }: { children: ReactNode }) {
     ['/dashboard/platform/messages', 'Messages', 'mail', `${s.messages.filter((m) => !m.read).length} new`],
     ['/dashboard/platform/api', 'API / Swagger', 'code', ''],
     ['/dashboard/platform/logs', 'Logs', 'list', ''],
+    ['/dashboard/platform/monitoring', 'Monitoring', 'pulse', ''],
+    ['/dashboard/platform/webhook-events', 'Webhook events', 'list', ''],
+    ['/dashboard/platform/tool-calls', 'Tool calls', 'code', ''],
+    ['/dashboard/platform/appointments', 'All appointments', 'cal', ''],
   ];
 
   const items = isSA ? platform : tenant;
@@ -158,6 +163,10 @@ export function DashboardShell({ children }: { children: ReactNode }) {
     ['super_admin', 'Super Admin'],
   ];
 
+  if (!isSA && onPlatform) {
+    return <div className="tk-dash" data-theme={s.theme}><section className="card">Super Admin access is required to view this page.</section></div>;
+  }
+
   return (
     <div className="tk-dash" data-theme={s.theme}>
       <div className="app">
@@ -168,8 +177,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
           </div>
           <div className="sec">{isSA ? 'Platform super admin' : 'Tenant operations'}</div>
 
-          {/* Quick Demo switcher in sidebar */}
-          <div style={{ padding: '0 8px 8px' }}>
+          {isDemoMode && <div style={{ padding: '0 8px 8px' }}>
             <div
               style={{
                 display: 'flex',
@@ -231,7 +239,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
               >
                 Super
               </button>
-            </div>
+            </div>}
           </div>
 
           <nav style={{ display: 'grid', gap: 6 }}>
@@ -261,7 +269,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
         </aside>
         <main>
           <div className="top">
-            <div className="seg" role="group" aria-label="Demo role switcher">
+            {isDemoMode && <div className="seg" role="group" aria-label="Demo role switcher">
               <span className="sim" style={{ fontWeight: 600, color: 'var(--blue)' }}>
                 Demo Role:
               </span>
@@ -276,7 +284,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
                   {l}
                 </button>
               ))}
-            </div>
+            </div>}
 
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               {s.role === 'staff' && s.elevated && (

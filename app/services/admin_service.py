@@ -4,25 +4,32 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.responses import FileResponse
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, case, delete, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.exceptions import BadRequestError, NotFoundError
 from app.models.agent import Agent
 from app.models.audit_log import AuditLog
+from app.models.appointment import Appointment, AppointmentHistory
 from app.models.call import Call
 from app.models.client import Client
+from app.models.customer import Customer
 from app.models.enquiry import Enquiry
-from app.models.enums import (AccessStatus, AgentStatus, BillingCycle,
+from app.models.enums import (AccessStatus, AgentStatus, AppointmentAction,
+                              AppointmentStatus, BillingCycle, ChangeSource,
                               OnboardingStage, PaymentStatus,
                               SubscriptionStatus)
 from app.models.payment import Payment
 from app.models.plan import MinutePack, Plan, Subscription
 from app.models.staff_pin import PinAttempt, StaffPin
 from app.models.user import User
+from app.models.webhook_event import WebhookEvent
 from app.schemas.admin import (AccessActionResponse, AccessRequestItem,
                                AdminAgentItem, AdminBusinessItem,
+                               AdminAppointmentItem, AdminHealthDetails,
+                               AdminMonitoringItem, AdminToolCallItem,
+                               AdminWebhookEventDetail, AdminWebhookEventItem,
                                AdminMessageItem, LogItem, PinResetResponse,
                                PinViewResponse)
 from app.core.security import hash_password
@@ -32,6 +39,7 @@ from app.services.billing_service import BillingService
 from app.services.email_service import EmailService
 from app.services.pin_service import PinService
 from app.services.protection_service import assert_user_not_protected
+from app.services.tool_call_log_service import sanitize_payload
 from app.utils.helpers import drop_nulls
 
 
@@ -159,11 +167,308 @@ class AdminService:
             message=f"Super Admin approved access for {client.business_name}",
         )
         self.db.commit()
-
         return AccessActionResponse(
             id=client.id,
             business=client.business_name,
             status="active",
+        )
+
+    # ---------------- 7. LOGWATCH ----------------
+
+    def get_webhook_events(
+        self, offset: int, limit: int, *, status: str | None, client_id: int | None,
+        event_type: str | None, date_from: datetime | None, date_to: datetime | None,
+    ) -> tuple[list[dict], int]:
+        stmt = select(WebhookEvent, Client.business_name).outerjoin(
+            Client, Client.id == WebhookEvent.client_id)
+        count_stmt = select(func.count(WebhookEvent.id))
+        filters = []
+        if status:
+            filters.append(WebhookEvent.status == status)
+        if client_id is not None:
+            filters.append(WebhookEvent.client_id == client_id)
+        if event_type:
+            filters.append(WebhookEvent.event_type == event_type)
+        if date_from is not None:
+            filters.append(WebhookEvent.created_at >= date_from)
+        if date_to is not None:
+            filters.append(WebhookEvent.created_at <= date_to)
+        if filters:
+            stmt = stmt.where(*filters)
+            count_stmt = count_stmt.where(*filters)
+        rows = self.db.execute(
+            stmt.order_by(WebhookEvent.created_at.desc(), WebhookEvent.id.desc())
+            .offset(offset).limit(limit)
+        ).all()
+        items = [
+            {
+                "id": event.id, "provider": event.provider, "event_id": event.event_id,
+                "event_type": sanitize_payload(event.event_type),
+                "client_id": event.client_id,
+                "business_name": sanitize_payload(business_name),
+                "status": event.status.value if hasattr(event.status, "value") else event.status,
+                "error_message": sanitize_payload(event.error_message),
+                "created_at": event.created_at,
+                "processed_at": event.processed_at,
+            }
+            for event, business_name in rows
+        ]
+        return items, self.db.scalar(count_stmt) or 0
+
+    def get_webhook_event(self, event_id: int) -> AdminWebhookEventDetail:
+        row = self.db.execute(
+            select(WebhookEvent, Client.business_name)
+            .outerjoin(Client, Client.id == WebhookEvent.client_id)
+            .where(WebhookEvent.id == event_id)
+        ).first()
+        if row is None:
+            raise NotFoundError("Webhook event not found", error_code="WEBHOOK_EVENT_NOT_FOUND")
+        event, business_name = row
+        return AdminWebhookEventDetail(
+            id=event.id, provider=event.provider,
+            event_id=sanitize_payload(event.event_id),
+            event_type=sanitize_payload(event.event_type), client_id=event.client_id,
+            business_name=sanitize_payload(business_name),
+            status=event.status.value if hasattr(event.status, "value") else event.status,
+            error_message=sanitize_payload(event.error_message), created_at=event.created_at,
+            processed_at=event.processed_at, payload=sanitize_payload(event.payload),
+        )
+
+    def get_tool_calls(
+        self, offset: int, limit: int, *, client_id: int | None, tool: str | None,
+        success: bool | None, date_from: datetime | None, date_to: datetime | None,
+    ) -> tuple[list[dict], int]:
+        stmt = select(AuditLog, Client.business_name).outerjoin(
+            Client, Client.id == AuditLog.client_id)
+        count_stmt = select(func.count(AuditLog.id))
+        filters = [AuditLog.action.like("sarvam_tool.%")]
+        if client_id is not None:
+            filters.append(or_(
+                AuditLog.client_id == client_id,
+                AuditLog.details["requested_client_id"].as_integer() == client_id,
+            ))
+        if tool:
+            filters.append(AuditLog.action == f"sarvam_tool.{tool.replace('-', '_')}")
+        if success is not None:
+            filters.append(AuditLog.details["success"].as_boolean() == success)
+        if date_from is not None:
+            filters.append(AuditLog.created_at >= date_from)
+        if date_to is not None:
+            filters.append(AuditLog.created_at <= date_to)
+        stmt = stmt.where(*filters)
+        count_stmt = count_stmt.where(*filters)
+        rows = self.db.execute(
+            stmt.order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .offset(offset).limit(limit)
+        ).all()
+        items = []
+        for log, business_name in rows:
+            details = log.details if isinstance(log.details, dict) else {}
+            items.append({
+                "id": log.id,
+                "client_id": log.client_id if log.client_id is not None
+                else details.get("requested_client_id"),
+                "business_name": sanitize_payload(business_name),
+                "tool": details.get("tool", log.action.removeprefix("sarvam_tool.")),
+                "action": log.action,
+                "tenant_resolution": details.get("tenant_resolution"),
+                "success": bool(details.get("success", False)),
+                "error_code": details.get("error_code"),
+                "message": sanitize_payload(log.message),
+                "appointment_id": details.get("appointment_id"),
+                "duration_ms": details.get("duration_ms", 0),
+                "request_id": sanitize_payload(details.get("request_id")),
+                "created_at": log.created_at,
+            })
+        return items, self.db.scalar(count_stmt) or 0
+
+    def get_admin_appointments(
+        self, offset: int, limit: int, *, client_id: int | None,
+        status: AppointmentStatus | None, source: str | None,
+        date_from: date | None, date_to: date | None,
+    ) -> tuple[list[dict], int]:
+        created_source = (
+            select(AppointmentHistory.source)
+            .where(
+                AppointmentHistory.client_id == Appointment.client_id,
+                AppointmentHistory.appointment_id == Appointment.id,
+                AppointmentHistory.action == AppointmentAction.CREATED,
+            )
+            .order_by(AppointmentHistory.id)
+            .limit(1)
+            .scalar_subquery()
+        )
+        source_label = case(
+            (created_source == ChangeSource.AI_AGENT, "ai_agent"),
+            else_="manual",
+        )
+        stmt = (
+            select(Appointment, Client.business_name, Customer.name, source_label)
+            .join(Client, Client.id == Appointment.client_id)
+            .join(Customer, and_(Customer.id == Appointment.customer_id,
+                                 Customer.client_id == Appointment.client_id))
+        )
+        count_stmt = select(func.count(Appointment.id)).join(
+            Client, Client.id == Appointment.client_id
+        ).join(Customer, and_(Customer.id == Appointment.customer_id,
+                              Customer.client_id == Appointment.client_id))
+        filters = []
+        if client_id is not None:
+            filters.append(Appointment.client_id == client_id)
+        if status is not None:
+            filters.append(Appointment.status == status)
+        if date_from is not None:
+            filters.append(Appointment.appointment_date >= date_from)
+        if date_to is not None:
+            filters.append(Appointment.appointment_date <= date_to)
+        if source:
+            filters.append(source_label == source)
+        if filters:
+            stmt = stmt.where(*filters)
+            count_stmt = count_stmt.where(*filters)
+        rows = self.db.execute(
+            stmt.order_by(Appointment.created_at.desc(), Appointment.id.desc())
+            .offset(offset).limit(limit)
+        ).all()
+        items = [
+            {
+                "id": appointment.id, "client_id": appointment.client_id,
+                "business_name": sanitize_payload(business_name),
+                "customer_name": sanitize_payload(customer_name),
+                "date": appointment.appointment_date,
+                "time": appointment.appointment_time.strftime("%H:%M"),
+                "status": appointment.status.value,
+                "source": source_name.value if hasattr(source_name, "value") else source_name,
+                "created_at": appointment.created_at,
+            }
+            for appointment, business_name, customer_name, source_name in rows
+        ]
+        return items, self.db.scalar(count_stmt) or 0
+
+    def get_monitoring(
+        self, offset: int, limit: int,
+    ) -> tuple[list[AdminMonitoringItem], int]:
+        client_stmt = select(Client).order_by(Client.created_at.desc(), Client.id.desc())
+        total = self.db.scalar(select(func.count(Client.id))) or 0
+        clients = self.db.scalars(client_stmt.offset(offset).limit(limit)).all()
+        if not clients:
+            return [], total
+        client_ids = [client.id for client in clients]
+
+        agents = self.db.execute(
+            select(Agent.client_id, Agent.status, Agent.provider_agent_id)
+            .where(Agent.client_id.in_(client_ids))
+            .order_by(Agent.created_at.desc(), Agent.id.desc())
+        ).all()
+        agent_summary = {}
+        for client_id, status, provider_agent_id in agents:
+            agent_summary.setdefault(client_id, (status, bool(provider_agent_id)))
+
+        calls = self.db.execute(
+            select(Call.client_id, func.max(func.coalesce(Call.started_at, Call.created_at)))
+            .where(Call.client_id.in_(client_ids))
+            .group_by(Call.client_id)
+        ).all()
+        call_times = dict(calls)
+
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        webhooks = self.db.execute(
+            select(
+                WebhookEvent.client_id,
+                func.max(WebhookEvent.created_at),
+                func.sum(case(
+                    (and_(WebhookEvent.status == "failed", WebhookEvent.created_at >= since), 1),
+                    else_=0,
+                )),
+            )
+            .where(WebhookEvent.client_id.in_(client_ids))
+            .group_by(WebhookEvent.client_id)
+        ).all()
+        webhook_summary = {
+            client_id: (last_received, int(failed_count or 0))
+            for client_id, last_received, failed_count in webhooks
+        }
+
+        latest_tool = (
+            select(
+                AuditLog.client_id.label("client_id"),
+                AuditLog.created_at.label("created_at"),
+                func.row_number().over(
+                    partition_by=AuditLog.client_id,
+                    order_by=(AuditLog.created_at.desc(), AuditLog.id.desc()),
+                ).label("position"),
+            )
+            .where(AuditLog.client_id.in_(client_ids),
+                   AuditLog.action.like("sarvam_tool.%"))
+            .subquery()
+        )
+        tool_times = dict(self.db.execute(
+            select(latest_tool.c.client_id, latest_tool.c.created_at)
+            .where(latest_tool.c.position == 1)
+        ).all())
+
+        latest_error = (
+            select(
+                AuditLog.client_id.label("client_id"),
+                AuditLog.message.label("message"),
+                func.row_number().over(
+                    partition_by=AuditLog.client_id,
+                    order_by=(AuditLog.created_at.desc(), AuditLog.id.desc()),
+                ).label("position"),
+            )
+            .where(
+                AuditLog.client_id.in_(client_ids),
+                AuditLog.action.like("sarvam_tool.%"),
+                AuditLog.details["success"].as_boolean().is_(False),
+            )
+            .subquery()
+        )
+        tool_errors = dict(self.db.execute(
+            select(latest_error.c.client_id, latest_error.c.message)
+            .where(latest_error.c.position == 1)
+        ).all())
+
+        billing = BillingService(self.db).get_billing_for_clients(client_ids)
+        items = []
+        for client in clients:
+            billing_data = billing[client.id]
+            agent_status, provider_present = agent_summary.get(client.id, (None, False))
+            last_webhook, failed_webhooks = webhook_summary.get(client.id, (None, 0))
+            items.append(AdminMonitoringItem(
+                client_id=client.id,
+                business_name=sanitize_payload(client.business_name),
+                access_status=client.access_status.value,
+                agent_status=agent_status.value if hasattr(agent_status, "value") else agent_status,
+                provider_agent_id_present=provider_present,
+                last_call_time=call_times.get(client.id),
+                minutes_used=billing_data["minutes_used"],
+                minutes_limit=billing_data["minutes_limit"],
+                usage_percent=billing_data["usage_percent"],
+                alert=billing_data["alert"],
+                failed_webhook_events_24h=failed_webhooks,
+                last_webhook_received_at=last_webhook,
+                last_tool_call_at=tool_times.get(client.id),
+                last_tool_call_error=sanitize_payload(tool_errors.get(client.id)),
+            ))
+        return items, total
+
+    def get_health_details(self) -> AdminHealthDetails:
+        database_ok = True
+        last_webhook = None
+        try:
+            self.db.execute(text("SELECT 1"))
+            last_webhook = self.db.scalar(select(func.max(WebhookEvent.created_at)))
+        except Exception:
+            database_ok = False
+        return AdminHealthDetails(
+            database_ok=database_ok,
+            last_webhook_received_at=last_webhook,
+            sarvam_api_key_set=bool(self.settings.sarvam_api_key),
+            sarvam_base_url_set=bool(self.settings.sarvam_base_url),
+            sarvam_webhook_secret_set=bool(self.settings.sarvam_webhook_secret),
+            email_backend=self.settings.email_backend,
+            resend_api_key_set=bool(self.settings.resend_api_key),
+            app_env_production=self.settings.app_env.lower() == "production",
         )
 
     def decline_access(self, client_id: int, reason: str, user: User, ip: str | None) -> AccessActionResponse:
@@ -247,11 +552,11 @@ class AdminService:
                 AdminBusinessItem(
                     id=client.id,
                     name=client.business_name,
-                    plan=billing_data.plan,
-                    minutes_used=billing_data.minutes_used,
-                    minutes_limit=billing_data.minutes_limit,
+                    plan=billing_data["plan"],
+                    minutes_used=billing_data["minutes_used"],
+                    minutes_limit=billing_data["minutes_limit"],
                     status=status_label,
-                    renews_on=billing_data.renews_on,
+                    renews_on=billing_data["renews_on"],
                     last_login=last_login,
                     has_pin=has_pin,
                 )
@@ -424,6 +729,7 @@ class AdminService:
                     name=agent.name,
                     languages=languages if isinstance(languages, list) else [str(languages)],
                     phone=agent.phone_number,
+                    phone_number=agent.phone_number,
                     online=agent.is_active,
                     calls_today=calls_today,
                     business_id=agent.client_id,

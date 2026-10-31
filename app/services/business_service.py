@@ -178,6 +178,22 @@ class BusinessService:
 
         # Atomic replacement in one transaction
         if data.hours is not None:
+            existing_hours = self.db.scalars(
+                select(BusinessHour)
+                .where(BusinessHour.client_id == client_id)
+                .order_by(BusinessHour.weekday)
+            ).all()
+            next_hours = [
+                (
+                    parse_time(h.open) if not h.closed else None,
+                    parse_time(h.close) if not h.closed else None,
+                    bool(h.closed),
+                )
+                for h in data.hours
+            ]
+            hours_changed = [
+                (h.open_time, h.close_time, bool(h.closed)) for h in existing_hours
+            ] != next_hours
             self.db.execute(delete(BusinessHour).where(BusinessHour.client_id == client_id))
             new_hours = []
             for day_idx, h in enumerate(data.hours):
@@ -191,18 +207,40 @@ class BusinessService:
                     )
                 )
             self.db.add_all(new_hours)
-            updated_fields.append("hours")
+            if hours_changed:
+                updated_fields.append("hours")
 
         if data.services is not None:
+            existing_services = self.db.scalars(
+                select(Service)
+                .where(Service.client_id == client_id)
+                .order_by(Service.sort_order, Service.id)
+            ).all()
+            next_services = [name.strip() for name in data.services]
+            services_changed = [service.name for service in existing_services] != next_services
             self.db.execute(delete(Service).where(Service.client_id == client_id))
             new_services = [
                 Service(client_id=client_id, name=name.strip(), sort_order=idx)
                 for idx, name in enumerate(data.services)
             ]
             self.db.add_all(new_services)
-            updated_fields.append("services")
+            if services_changed:
+                updated_fields.append("services")
 
         if data.staff is not None:
+            existing_staff = self.db.scalars(
+                select(StaffMember)
+                .where(StaffMember.client_id == client_id)
+                .order_by(StaffMember.id)
+            ).all()
+            next_staff = [
+                (member.name.strip(), member.title.strip() if member.title else None, member.days)
+                for member in data.staff
+            ]
+            staff_changed = [
+                (member.name, member.title, list(member.available_days))
+                for member in existing_staff
+            ] != next_staff
             self.db.execute(delete(StaffMember).where(StaffMember.client_id == client_id))
             new_staff = [
                 StaffMember(
@@ -214,14 +252,15 @@ class BusinessService:
                 for s in data.staff
             ]
             self.db.add_all(new_staff)
-            updated_fields.append("staff")
+            if staff_changed:
+                updated_fields.append("staff")
 
         record_audit(
             self.db,
             "business.update",
             user_id=user.id,
             client_id=client_id,
-            details={"updated": updated_fields},
+            details={"updated": updated_fields, "updated_fields": updated_fields},
             ip_address=ip,
         )
         self.db.commit()

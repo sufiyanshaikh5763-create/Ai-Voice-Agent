@@ -8,7 +8,7 @@ from tests.helpers import make_appointment, make_customer, register_ok
 SECRET = "test-sarvam-webhook-secret"
 
 
-def _tenant(client, email="admin@sarvam.test"):
+def _tenant(client, email="admin@example.com"):
     data = register_ok(client, email)
     return data["tokens"]["access_token"], data["user"]["client_id"]
 

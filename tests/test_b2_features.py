@@ -20,7 +20,7 @@ from app.models.enums import AccessStatus, CallDirection, CallStatus, PlanKey
 from app.models.plan import MinutePack, Plan, Subscription
 from app.services.billing_service import minutes_for_call
 from tests.helpers import (auth_headers, create_staff, elevated_headers,
-                           make_elevation_token, register, register_ok)
+                           login_token, make_elevation_token, register, register_ok)
 
 
 # ---------------- 1. MINUTES CALCULATION ----------------
@@ -123,6 +123,7 @@ def test_billing_me_success_and_alerts(client, db):
     # Add a call with 800 minutes = 48000 seconds
     c1 = Call(
         client_id=cid,
+        phone_number="+919876543210",
         direction=CallDirection.INBOUND,
         status=CallStatus.COMPLETED,
         duration=48000,
@@ -141,6 +142,7 @@ def test_billing_me_success_and_alerts(client, db):
     # Simulate limit alert (>= 100%)
     c2 = Call(
         client_id=cid,
+        phone_number="+919876543211",
         direction=CallDirection.INBOUND,
         status=CallStatus.COMPLETED,
         duration=12060,  # 201 minutes -> ceil = 201
@@ -189,7 +191,7 @@ def test_get_business_bundle(client, db):
     # Verify business info
     b = data["business"]
     assert b["id"] == reg["user"]["client_id"]
-    assert b["name"] == "Biz bizbundle"
+    assert b["name"] == "Biz"
     assert b["plan"] == "growth"
     assert b["minutes_used"] == 0
     assert b["minutes_limit"] == 1000
@@ -223,9 +225,9 @@ def test_patch_business_rbac(client, db):
     admin_token = reg["tokens"]["access_token"]
 
     # Create staff user
-    staff = create_staff(client, admin_token, "staff_patch@test.com", "Staff Member")
-    staff_token = staff["tokens"]["access_token"]
-    staff_id = staff["user"]["id"]
+    staff = create_staff(client, admin_token, "staff_patch@test.com", "client_staff")
+    staff_token = login_token(client, "staff_patch@test.com")
+    staff_id = staff["id"]
 
     valid_payload = {
         "services": ["Consultation", "Follow-up"]
@@ -388,6 +390,7 @@ def test_billing_me_tenant_isolation(client, db):
     # Add call to Tenant A only (100 minutes = 6000 seconds)
     c_a = Call(
         client_id=cid_a,
+        phone_number="+919876543210",
         direction=CallDirection.INBOUND,
         status=CallStatus.COMPLETED,
         duration=6000,
@@ -433,4 +436,3 @@ def test_business_bundle_tenant_isolation(client, db):
     assert bundle_b["business"]["id"] != cid_a
     # Tenant B has no services seeded by default, isolated from Tenant A
     assert bundle_b["services"] == []
-

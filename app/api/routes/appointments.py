@@ -28,10 +28,11 @@ def list_appointments(
     day: date | None = Query(None, alias="date", description="Exact appointment date"),
     date_from: date | None = None, date_to: date | None = None,
     customer_id: int | None = Query(None, alias="customer"),
+    order: str = Query("asc", pattern="^(asc|desc)$"),
 ):
     items, total = AppointmentService(db, tenant_id).list(
         page.offset, page.limit, status=status_filter, day=day, date_from=date_from,
-        date_to=date_to, customer_id=customer_id)
+        date_to=date_to, customer_id=customer_id, descending=order == "desc")
     return paginated(items, total, page, AppointmentOut)
 
 

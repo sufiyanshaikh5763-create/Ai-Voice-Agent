@@ -41,7 +41,7 @@ class AppointmentService:
     # ----- queries -----
     def list(self, offset: int, limit: int, *, status: AppointmentStatus | None,
              day: date | None, date_from: date | None, date_to: date | None,
-             customer_id: int | None) -> tuple[list[Appointment], int]:
+             customer_id: int | None, descending: bool = False) -> tuple[list[Appointment], int]:
         filters = []
         if status is not None:
             filters.append(Appointment.status == status)
@@ -55,7 +55,12 @@ class AppointmentService:
             filters.append(Appointment.customer_id == customer_id)
         return self.repo.list(
             offset=offset, limit=limit, filters=filters,
-            order_by=[Appointment.appointment_date, Appointment.appointment_time, Appointment.id])
+            order_by=(
+                [Appointment.appointment_date.desc(), Appointment.appointment_time.desc(),
+                 Appointment.id.desc()]
+                if descending else
+                [Appointment.appointment_date, Appointment.appointment_time, Appointment.id]
+            ))
 
     def get(self, appointment_id: int) -> Appointment:
         appointment = self.repo.get(appointment_id)

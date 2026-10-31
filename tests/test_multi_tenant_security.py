@@ -491,17 +491,48 @@ def test_cannot_read_modify_or_delete_other_tenants_agent(client, db, tenants):
     b_agent = create_agent(client, tenants["b"]["token"], "Agent B")
     h = auth_headers(tenants["a"]["token"])
     assert client.get(f"/api/v1/agents/{b_agent['id']}", headers=h).status_code == 404
-    assert client.patch(f"/api/v1/agents/{b_agent['id']}", headers=h,
-                        json={"name": "hacked"}).status_code == 404
-    assert client.delete(f"/api/v1/agents/{b_agent['id']}", headers=h).status_code == 404
+    patched = client.patch(f"/api/v1/agents/{b_agent['id']}", headers=h,
+                           json={"name": "hacked"})
+    assert patched.status_code == 403
+    db.expire_all()
     assert db.get(Agent, b_agent["id"]).name == "Agent B"
+    deleted = client.delete(f"/api/v1/agents/{b_agent['id']}", headers=h)
+    assert deleted.status_code == 403
+    db.expire_all()
+    assert db.get(Agent, b_agent["id"]).name == "Agent B"
+    assert client.get(f"/api/v1/agents/{b_agent['id']}", headers=h).status_code == 404
 
 
-def test_body_client_id_is_ignored_when_creating_agent(client, tenants):
-    b_id = tenants["b"]["client_id"]
+def test_client_cannot_create_agent_even_with_forged_client_id(client, tenants):
     resp = client.post("/api/v1/agents", headers=auth_headers(tenants["a"]["token"]),
-                       json={"name": "New", "client_id": b_id})
+                       json={"name": "New", "client_id": tenants["b"]["client_id"]})
+    assert resp.status_code == 403
+    tenant_a_agents = client.get(
+        "/api/v1/agents", headers=auth_headers(tenants["a"]["token"])
+    ).json()["data"]
+    tenant_b_agents = client.get(
+        "/api/v1/agents", headers=auth_headers(tenants["b"]["token"])
+    ).json()["data"]
+    assert tenant_a_agents == []
+    assert tenant_b_agents == []
+
+
+def test_admin_agent_creation_uses_path_tenant_not_body(client, tenants):
+    from tests.helpers import super_admin_headers
+
+    resp = client.post(
+        f"/api/v1/admin/clients/{tenants['a']['client_id']}/agents",
+        headers=super_admin_headers(client),
+        json={"name": "New", "client_id": tenants["b"]["client_id"]},
+    )
+    assert resp.status_code == 201
     assert resp.json()["data"]["client_id"] == tenants["a"]["client_id"]
+    assert len(client.get(
+        "/api/v1/agents", headers=auth_headers(tenants["a"]["token"])
+    ).json()["data"]) == 1
+    assert client.get(
+        "/api/v1/agents", headers=auth_headers(tenants["b"]["token"])
+    ).json()["data"] == []
 
 
 def test_only_super_admin_can_list_a_clients_agents(client, tenants):
@@ -584,13 +615,19 @@ def test_super_admin_per_client_summary_matches_that_clients_own_view(client, db
 
 
 # ---------------- structural guards (fail when a future stage forgets isolation) ----------------
-# Tables whose client_id may be NULL by design (SUPER_ADMIN users, platform-level logs/events).
-NULLABLE_TENANT_TABLES = {"users", "audit_logs", "webhook_events", "call_attempts"}
+# Global catalog tables are not tenant-owned and do not have client_id.
+GLOBAL_TABLES = {"plans"}
+# These records belong to users and intentionally have no direct tenant key.
+USER_SCOPED_TABLES = {"email_verifications", "refresh_tokens"}
+# client_id may be NULL for super-admin/platform records and public contact enquiries.
+NULLABLE_TENANT_TABLES = {
+    "users", "audit_logs", "webhook_events", "call_attempts", "enquiries"
+}
 
 
 def test_every_table_has_client_id():
     for table in Base.metadata.sorted_tables:
-        if table.name == "clients":
+        if table.name == "clients" or table.name in GLOBAL_TABLES | USER_SCOPED_TABLES:
             continue
         assert "client_id" in table.c, f"{table.name} has no client_id column"
         if table.name not in NULLABLE_TENANT_TABLES:
@@ -600,11 +637,18 @@ def test_every_table_has_client_id():
 def test_tenant_tables_have_client_id_index_or_fk():
     insp = inspect(engine)
     for table in Base.metadata.sorted_tables:
-        if table.name == "clients":
+        if table.name == "clients" or table.name in GLOBAL_TABLES | USER_SCOPED_TABLES:
             continue
         fks = insp.get_foreign_keys(table.name)
         fk_cols = {c for fk in fks for c in fk["constrained_columns"]}
         assert "client_id" in fk_cols, f"{table.name}.client_id is not a foreign key"
+
+    for table_name in USER_SCOPED_TABLES:
+        user_scoped_fks = insp.get_foreign_keys(table_name)
+        assert any(
+            "user_id" in fk["constrained_columns"] and fk["referred_table"] == "users"
+            for fk in user_scoped_fks
+        ), f"{table_name}.user_id must be a foreign key to users"
 
 
 def _requires_auth(dependant) -> bool:
@@ -621,6 +665,12 @@ PUBLIC_ROUTES = {"/api/v1/health", "/api/v1/auth/register", "/api/v1/auth/login"
                  "/api/v1/webhooks/sarvam/{token}/{client_id}/appointments/book",
                  "/api/v1/webhooks/sarvam/{token}/{client_id}/appointments/reschedule",
                  "/api/v1/webhooks/sarvam/{token}/{client_id}/appointments/cancel"}
+# Logout revokes the refresh token in its request body and intentionally has no access-token dependency.
+PUBLIC_ROUTES.add("/api/v1/auth/logout")
+# Forgot-password is public and rate-limited; the admin reset-password route remains super-admin-only.
+PUBLIC_ROUTES.add("/api/v1/auth/forgot-password")
+# Public plan catalog and rate-limited contact form are used before sign-in.
+PUBLIC_ROUTES.update({"/api/v1/plans", "/api/v1/contact"})
 
 
 def test_every_api_route_requires_authentication_unless_allowlisted():

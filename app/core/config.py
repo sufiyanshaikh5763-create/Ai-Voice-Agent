@@ -24,8 +24,10 @@ class Settings(BaseSettings):
     sarvam_api_key: str = ""
     sarvam_base_url: str = ""
     sarvam_webhook_secret: str = ""
+    sarvam_legacy_shared_token_enabled: bool = True
+    public_api_base_url: str = ""
 
-    default_timezone: str = "UTC"
+    default_timezone: str = "Asia/Kolkata"
     cors_origins: str = ""
     rate_limit_enabled: bool = True
 

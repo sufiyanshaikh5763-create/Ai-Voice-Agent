@@ -77,6 +77,27 @@ def create_staff(client: TestClient, admin_token: str, email: str, role: str = "
     return resp.json()["data"]
 
 
+def seed_default_plans(db) -> None:
+    """Seed the global plan catalog for tests after the tenant tables are reset."""
+    from sqlalchemy import select
+
+    from app.models.plan import Plan
+
+    existing_keys = set(db.scalars(select(Plan.key)).all())
+    plans = [
+        Plan(key="starter", name="Starter", monthly_price=2250, yearly_price=25200,
+             included_minutes=300, max_call_minutes=5, is_custom=False),
+        Plan(key="growth", name="Growth", monthly_price=5700, yearly_price=66000,
+             included_minutes=1000, max_call_minutes=5, is_custom=False),
+        Plan(key="business", name="Business", monthly_price=14250, yearly_price=165000,
+             included_minutes=2500, max_call_minutes=5, is_custom=False),
+        Plan(key="enterprise", name="Enterprise", monthly_price=None, yearly_price=None,
+             included_minutes=0, max_call_minutes=5, is_custom=True),
+    ]
+    db.add_all([plan for plan in plans if plan.key not in existing_keys])
+    db.commit()
+
+
 def make_customer(client: TestClient, token: str, name: str = "Asha", phone: str = "+919876543210") -> dict:
     resp = client.post("/api/v1/customers", headers=auth_headers(token),
                        json={"name": name, "phone": phone})
@@ -116,9 +137,37 @@ def make_call(db, client_id: int, **kw):
 
 
 def create_agent(client: TestClient, token: str, name: str = "Zoya", **extra) -> dict:
-    resp = client.post("/api/v1/agents", headers=auth_headers(token), json={"name": name, **extra})
+    client_response = client.get("/api/v1/clients/me", headers=auth_headers(token))
+    assert client_response.status_code == 200, client_response.text
+    client_id = client_response.json()["data"]["id"]
+    resp = create_admin_agent(client, client_id, name=name, **extra)
     assert resp.status_code == 201, resp.text
     return resp.json()["data"]
+
+
+def super_admin_headers(client: TestClient) -> dict:
+    from sqlalchemy import select
+
+    from app.core.database import SessionLocal
+    from app.models.enums import UserRole
+    from app.models.user import User
+
+    email = "test-agentlink-superadmin@example.com"
+    with SessionLocal() as db:
+        if db.scalar(select(User).where(User.email == email)) is None:
+            make_user(db, None, UserRole.SUPER_ADMIN, email)
+    return auth_headers(login_token(client, email))
+
+
+def create_admin_agent(
+    client: TestClient, client_id: int, name: str = "Zoya", **extra,
+):
+    headers = super_admin_headers(client)
+    return client.post(
+        f"/api/v1/admin/clients/{client_id}/agents",
+        headers=headers,
+        json={"name": name, **extra},
+    )
 
 
 def webhook_body(**overrides) -> dict:

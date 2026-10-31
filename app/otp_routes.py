@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, EmailStr
-from app.otp_service import send_otp, verify_otp
+from app.otp_service import EmailConfigurationError, send_otp, verify_otp
 
 router = APIRouter(prefix="/auth", tags=["otp"])
 
@@ -17,6 +17,8 @@ def send_otp_route(body: EmailIn):
         send_otp(body.email)
     except ValueError as e:
         raise HTTPException(429, str(e))
+    except EmailConfigurationError:
+        raise HTTPException(503, "OTP email service is not configured")
     except Exception:
         raise HTTPException(502, "Could not send email, try again")
     return {"message": "If the email is valid, a code has been sent."}

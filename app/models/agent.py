@@ -1,5 +1,5 @@
-from sqlalchemy import (Boolean, ForeignKey, String, Text,
-                        UniqueConstraint)
+from sqlalchemy import (Boolean, ForeignKey, Index, String, Text, UniqueConstraint,
+                        text)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -13,6 +13,13 @@ class Agent(TimestampMixin, Base):
         # Target for composite tenant-safe foreign keys (calls -> agents).
         UniqueConstraint("client_id", "id", name="uq_agents_client_id_id"),
         UniqueConstraint("provider", "provider_agent_id", name="uq_agents_provider_ref"),
+        Index(
+            "uq_agents_phone_number",
+            "phone_number",
+            unique=True,
+            postgresql_where=text("phone_number IS NOT NULL"),
+            sqlite_where=text("phone_number IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

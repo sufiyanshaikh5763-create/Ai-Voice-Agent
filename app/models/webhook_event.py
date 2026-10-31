@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -12,7 +12,11 @@ class WebhookEvent(Base):
     """Received provider events; the unique key makes webhook processing idempotent."""
 
     __tablename__ = "webhook_events"
-    __table_args__ = (UniqueConstraint("provider", "event_id", name="uq_webhook_provider_event"),)
+    __table_args__ = (
+        UniqueConstraint("provider", "event_id", name="uq_webhook_provider_event"),
+        Index("ix_webhook_events_status_created_at", "status", "created_at"),
+        Index("ix_webhook_events_client_created_at", "client_id", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -26,6 +30,7 @@ class WebhookEvent(Base):
     )
     error_message: Mapped[str | None] = mapped_column(Text)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    request_id: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

@@ -11,7 +11,10 @@ class AuditLog(Base):
     """Append-only record of sensitive operations. Never store secrets in `details`."""
 
     __tablename__ = "audit_logs"
-    __table_args__ = (Index("ix_audit_client_created", "client_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_audit_client_created", "client_id", "created_at"),
+        Index("ix_audit_logs_action_created_at", "action", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     client_id: Mapped[int | None] = mapped_column(ForeignKey("clients.id"))

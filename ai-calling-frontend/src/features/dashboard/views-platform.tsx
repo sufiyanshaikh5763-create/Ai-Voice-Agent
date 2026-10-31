@@ -2,18 +2,26 @@
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { useDash } from './store';
-import { Chips, Dialog, Meter, PageHead, Toggle } from './ui';
+import { Chips, CopyButton, Dialog, Meter, PageHead, Toggle } from './ui';
 import { PLAN_PRICE, inr } from './util';
-import type { ContactMessage } from './types';
+import type { AdminClientIntegration, AdminClientToolToken, Agent, ContactMessage } from './types';
 import {
+  adminAgentErrorMessage,
   approveAccess,
+  createClientToolToken,
   declineAccess,
+  fetchAdminAgentLinks,
+  fetchAdminIntegration,
   updateBusinessStatus,
   addMinutePack,
   viewBusinessPin,
+  linkAdminAgent,
+  unlinkAdminAgent,
+  updateAdminAgent,
   resetBusinessPin,
   toggleAgentPower,
   updateContactMessage,
+  type AdminAgentInput,
 } from './api';
 
 const near = (u: number, l: number) => u / l >= 0.9;
@@ -202,29 +210,332 @@ export function BusinessesPlans() {
 }
 
 export function FleetView() {
-  const { s, toast, actor, reload } = useDash();
+  const { s, isSA, toast, actor, reload, openModal } = useDash();
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [retry, setRetry] = useState(0);
+  const [issuedToken, setIssuedToken] = useState<AdminClientToolToken | null>(null);
+  const [issuedClientName, setIssuedClientName] = useState('');
   const name = (id: string) => s.businesses.find((b) => b.id === id)?.name ?? id;
 
+  useEffect(() => {
+    if (!isSA) return;
+    let active = true;
+    setLoading(true);
+    setError('');
+    fetchAdminAgentLinks()
+      .then((result) => { if (active) setAgents(result); })
+      .catch((cause: unknown) => { if (active) setError(cause instanceof Error ? cause.message : 'Unable to load agent links.'); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [isSA, retry]);
+
+  const refreshAgents = async () => {
+    await reload();
+    setAgents(await fetchAdminAgentLinks());
+  };
+
+  const openIntegration = (clientId: string, clientName: string) => {
+    openModal(
+      <ClientIntegrationDialog
+        clientId={clientId}
+        clientName={clientName}
+        onToken={(token) => {
+          setIssuedClientName(clientName);
+          setIssuedToken(token);
+          setAgents((current) => current.map((agent) => agent.business_id === clientId
+            ? { ...agent, tool_token_exists: true }
+            : agent));
+        }}
+      />
+    );
+  };
+
   const flip = async (id: string) => {
-    const a = s.agents.find((x) => x.id === id);
+    const a = agents.find((x) => x.id === id);
     if (!a) return;
     try {
       await toggleAgentPower(id, !a.online, actor);
-      await reload();
+      await refreshAgents();
       toast(`Turned ${a.name} ${!a.online ? 'on' : 'off'}`);
     } catch (err: any) {
       toast(err.message || 'Error toggling agent power');
     }
   };
 
+  if (!isSA) return <AccessDenied />;
+
   return (
     <>
-      <PageHead title="AI agents, all businesses" sub="Switch any agent on or off. Changes are logged." />
-      <div className="card" style={{ overflow: 'auto' }}>
-        <table><thead><tr><th>Agent</th><th>Business</th><th>Languages</th><th>Calls today</th><th>Power</th></tr></thead>
-          <tbody>{s.agents.map((a) => <tr key={a.id}><td><b>{a.name}</b></td><td>{name(a.business_id)}</td><td>{a.languages}</td><td>{a.calls_today}</td><td><Toggle on={a.online} label={`Power ${a.name}`} onClick={() => flip(a.id)} /></td></tr>)}</tbody></table>
+      <PageHead
+        title="AI agents, all businesses"
+        sub="Link Sarvam agents and phone numbers to clients, manage their tool credentials, and control agent status."
+        right={<button className="pri" disabled={s.businesses.length === 0} onClick={() => openModal(<AgentLinkDialog businesses={s.businesses} onSaved={refreshAgents} />)}>Link agent</button>}
+      />
+      <div className="card" style={{ overflow: 'auto', marginBottom: 14 }}>
+        <h3>Client integrations</h3>
+        <table><thead><tr><th>Client</th><th>Client ID</th><th /></tr></thead>
+          <tbody>{s.businesses.map((business) => (
+            <tr key={business.id}>
+              <td><b>{business.name}</b></td>
+              <td className="mono">{business.id}</td>
+              <td><button onClick={() => openIntegration(business.id, business.name)}>Integration</button></td>
+            </tr>
+          ))}</tbody></table>
+        {s.businesses.length === 0 && <p className="mut">No clients are available.</p>}
       </div>
+      <div className="card" style={{ overflow: 'auto' }}>
+        <h3>Agent links</h3>
+        {loading ? <p role="status">Loading linked agents…</p> : error
+          ? <div role="alert"><p>{error}</p><button onClick={() => setRetry((value) => value + 1)}>Retry</button></div>
+          : <table><thead><tr><th>Agent</th><th>Client</th><th>Provider agent ID</th><th>Phone number</th><th>Status</th><th>Tool token</th><th>Actions</th></tr></thead>
+            <tbody>{agents.map((a) => (
+              <tr key={a.id}>
+                <td><b>{a.name}</b></td>
+                <td>{name(a.business_id)}</td>
+                <td className="mono">{a.provider_agent_id || '—'}</td>
+                <td>{a.phone ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}><span className="mono">{a.phone}</span><CopyButton value={a.phone} label="Copy" /></span> : '—'}</td>
+                <td><span className={`st ${a.online ? 'completed' : 'cancelled'}`}>{a.status ? `${a.status.charAt(0).toUpperCase()}${a.status.slice(1)}` : a.online ? 'Active' : 'Inactive'}</span></td>
+                <td><span className={`st ${a.tool_token_exists ? 'completed' : 'rescheduled'}`}>{a.tool_token_exists ? 'Token set' : 'No token'}</span></td>
+                <td><div className="acts" style={{ margin: 0 }}>
+                  <button onClick={() => openModal(<AgentLinkDialog businesses={s.businesses} agent={a} onSaved={refreshAgents} />)}>Edit</button>
+                  <button className="dng" onClick={() => openModal(<UnlinkAgentDialog agent={a} onUnlinked={refreshAgents} />)}>Unlink</button>
+                  <Toggle on={a.online} label={`Power ${a.name}`} onClick={() => flip(a.id)} />
+                </div></td>
+              </tr>
+            ))}</tbody></table>}
+        {!loading && !error && agents.length === 0 && <p className="mut">No linked agents yet. Use Link agent to assign one to a client.</p>}
+      </div>
+      {issuedToken && <IssuedTokenDialog token={issuedToken} clientName={issuedClientName} onClose={() => setIssuedToken(null)} />}
     </>
+  );
+}
+
+function AgentLinkDialog({ businesses, agent, onSaved }: { businesses: { id: string; name: string }[]; agent?: Agent; onSaved: () => Promise<void> }) {
+  const { closeModal, toast } = useDash();
+  const [clientId, setClientId] = useState(agent?.business_id ?? businesses[0]?.id ?? '');
+  const [name, setName] = useState(agent?.name ?? '');
+  const [providerAgentId, setProviderAgentId] = useState(agent?.provider_agent_id ?? '');
+  const [phone, setPhone] = useState(agent?.phone.replace(/[^\d+]/g, '') ?? '');
+  const [phoneTouched, setPhoneTouched] = useState(false);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const phoneValid = /^\+[1-9]\d{6,14}$/.test(phone);
+
+  const save = async () => {
+    setPhoneTouched(true);
+    setError('');
+    if (!clientId && !agent) {
+      setError('Select a client.');
+      return;
+    }
+    if (!name.trim() || !providerAgentId.trim() || !phoneValid) {
+      setError('Enter an agent name, provider agent ID, and valid E.164 phone number.');
+      return;
+    }
+    const input: AdminAgentInput = {
+      name: name.trim(),
+      provider: 'sarvam',
+      provider_agent_id: providerAgentId.trim(),
+      phone_number: phone,
+    };
+    setBusy(true);
+    try {
+      if (agent) await updateAdminAgent(agent.id, input);
+      else await linkAdminAgent(clientId, input);
+      await onSaved();
+      closeModal();
+      toast(agent ? 'Agent link updated' : 'Agent linked to client');
+    } catch (cause: unknown) {
+      setError(adminAgentErrorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog
+      title={agent ? `Edit ${agent.name}` : 'Link a Sarvam agent'}
+      actions={<><button onClick={closeModal}>Cancel</button><button className="pri" disabled={busy} onClick={save}>{busy ? 'Saving…' : agent ? 'Save changes' : 'Link agent'}</button></>}
+    >
+      {!agent && <label>Client<select value={clientId} onChange={(event) => setClientId(event.target.value)} required>
+        {businesses.map((business) => <option key={business.id} value={business.id}>{business.name}</option>)}
+      </select></label>}
+      <label>Agent name<input maxLength={150} value={name} onChange={(event) => setName(event.target.value)} required /></label>
+      <label>Provider<input value="Sarvam" readOnly /></label>
+      <label>Provider agent ID<input maxLength={255} value={providerAgentId} onChange={(event) => setProviderAgentId(event.target.value)} required /></label>
+      <label>Phone number (E.164)
+        <input
+          type="tel"
+          value={phone}
+          onChange={(event) => setPhone(event.target.value)}
+          onBlur={() => setPhoneTouched(true)}
+          placeholder="+919876543210"
+          aria-invalid={phoneTouched && !phoneValid}
+          aria-describedby="agent-phone-hint"
+          required
+        />
+      </label>
+      <small id="agent-phone-hint" className="mut">Use + followed by the country code and number, for example +919876543210.</small>
+      {phoneTouched && !phoneValid && <small role="alert" style={{ color: 'var(--bad)' }}>Enter a valid E.164 number such as +919876543210.</small>}
+      {error && <p role="alert" style={{ color: 'var(--bad)' }}>{error}</p>}
+    </Dialog>
+  );
+}
+
+function UnlinkAgentDialog({ agent, onUnlinked }: { agent: Agent; onUnlinked: () => Promise<void> }) {
+  const { closeModal, toast } = useDash();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const unlink = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      await unlinkAdminAgent(agent.id);
+      await onUnlinked();
+      closeModal();
+      toast(`${agent.name} deactivated`);
+    } catch (cause: unknown) {
+      setError(adminAgentErrorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog title={`Unlink ${agent.name}?`} actions={<><button onClick={closeModal}>Cancel</button><button className="dng" disabled={busy} onClick={unlink}>{busy ? 'Unlinking…' : 'Unlink agent'}</button></>}>
+      <p>This deactivates the agent; it does not delete the agent or its call history.</p>
+      {error && <p role="alert" style={{ color: 'var(--bad)' }}>{error}</p>}
+    </Dialog>
+  );
+}
+
+function displayDate(value: string | null): string {
+  return value ? new Date(value).toLocaleString() : '—';
+}
+
+function ClientIntegrationDialog({ clientId, clientName, onToken }: { clientId: string; clientName: string; onToken: (token: AdminClientToolToken) => void }) {
+  const { closeModal, openModal } = useDash();
+  const [integration, setIntegration] = useState<AdminClientIntegration | null>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [retry, setRetry] = useState(0);
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError('');
+    fetchAdminIntegration(clientId)
+      .then((result) => { if (active) setIntegration(result); })
+      .catch((cause: unknown) => { if (active) setError(cause instanceof Error ? cause.message : 'Unable to load integration details.'); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [clientId, retry]);
+
+  const confirmToken = () => openModal(
+    <TokenRotationDialog
+      clientId={clientId}
+      clientName={clientName}
+      rotating={Boolean(integration?.credential_exists)}
+      onToken={(token) => {
+        onToken(token);
+        closeModal();
+      }}
+    />
+  );
+
+  return (
+    <Dialog title={`${clientName} integration`} actions={<><button onClick={closeModal}>Close</button>{integration && <button className="pri" onClick={confirmToken}>{integration.credential_exists ? 'Rotate token' : 'Generate token'}</button>}</>}>
+      {loading && <p role="status">Loading integration details…</p>}
+      {error && <div role="alert"><p>{error}</p><button onClick={() => setRetry((value) => value + 1)}>Retry</button></div>}
+      {integration && <>
+        {!integration.urls_are_absolute && <p role="note" className="vo">These URLs are relative. Set PUBLIC_API_BASE_URL on the server to provide absolute URLs.</p>}
+        <p><b>Signed event webhook URL</b></p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}><code className="mono" style={{ wordBreak: 'break-all' }}>{integration.signed_event_webhook_url}</code><CopyButton value={integration.signed_event_webhook_url} /></div>
+        <h4>Tool URL patterns</h4>
+        <div style={{ display: 'grid', gap: 8 }}>
+          {Object.entries(integration.tool_url_patterns).map(([action, url]) => (
+            <div key={action}>
+              <small>{action}</small>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}><code className="mono" style={{ wordBreak: 'break-all' }}>{url}</code><CopyButton value={url} /></div>
+            </div>
+          ))}
+        </div>
+        <h4>Tool token</h4>
+        <p><span className={`st ${integration.credential_exists ? 'completed' : 'rescheduled'}`}>{integration.credential_exists ? 'Token exists' : 'No token'}</span></p>
+        <dl className="lw-details">
+          <dt>Created</dt><dd>{displayDate(integration.credential_created_at)}</dd>
+          <dt>Rotated</dt><dd>{displayDate(integration.credential_rotated_at)}</dd>
+          <dt>Last used</dt><dd>{displayDate(integration.credential_last_used_at)}</dd>
+        </dl>
+        <h4>Linked agents</h4>
+        {integration.agents.length ? <div style={{ display: 'grid', gap: 6 }}>
+          {integration.agents.map((agent) => (
+            <div key={agent.id} className="ro" style={{ display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <span>{agent.name} · ID <code className="mono">{agent.id}</code> · {agent.phone_number || 'No phone number'} · {agent.status}</span>
+              <div style={{ display: 'flex', gap: 6 }}>{agent.phone_number && <CopyButton value={agent.phone_number} label="Copy phone" />}<CopyButton value={agent.id} label="Copy agent ID" /></div>
+            </div>
+          ))}
+        </div> : <p className="mut">No agents are linked to this client.</p>}
+        <p className="mut" style={{ marginTop: 14 }}>The legacy shared token is still accepted until it is disabled on the server.</p>
+      </>}
+    </Dialog>
+  );
+}
+
+function TokenRotationDialog({ clientId, clientName, rotating, onToken }: { clientId: string; clientName: string; rotating: boolean; onToken: (token: AdminClientToolToken) => void }) {
+  const { closeModal } = useDash();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const generate = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const token = await createClientToolToken(clientId);
+      onToken(token);
+    } catch {
+      setError('Unable to generate the tool token. Check Super Admin access and try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog title={`${rotating ? 'Rotate' : 'Generate'} ${clientName} tool token?`} actions={<><button onClick={closeModal}>Cancel</button><button className="dng" disabled={busy} onClick={generate}>{busy ? 'Working…' : rotating ? 'Rotate token' : 'Generate token'}</button></>}>
+      <p>The old token stops working immediately. Update the Sarvam tool URLs with the new token as soon as it is generated.</p>
+      {error && <p role="alert" style={{ color: 'var(--bad)' }}>{error}</p>}
+    </Dialog>
+  );
+}
+
+function IssuedTokenDialog({ token, clientName, onClose }: { token: AdminClientToolToken; clientName: string; onClose: () => void }) {
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+  return (
+    <div className="ov" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <div className="md" role="dialog" aria-modal="true">
+        <h3>{clientName} tool token</h3>
+        <p role="alert"><b>This will not be shown again.</b> Copy the token and URLs now.</p>
+        {!token.urls_are_absolute && <p className="vo">These URLs are relative. Set PUBLIC_API_BASE_URL on the server to provide absolute URLs.</p>}
+        <label>Raw token
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <code className="mono" style={{ wordBreak: 'break-all' }}>{token.token}</code>
+            <CopyButton value={token.token} label="Copy token" />
+          </div>
+        </label>
+        <h4>Ready-to-paste tool URLs</h4>
+        <div style={{ display: 'grid', gap: 8 }}>
+          {Object.entries(token.tool_urls).map(([action, url]) => (
+            <div key={action}>
+              <small>{action}</small>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}><code className="mono" style={{ wordBreak: 'break-all' }}>{url}</code><CopyButton value={url} /></div>
+            </div>
+          ))}
+        </div>
+        <div className="acts"><button onClick={onClose}>Close</button></div>
+      </div>
+    </div>
   );
 }
 
